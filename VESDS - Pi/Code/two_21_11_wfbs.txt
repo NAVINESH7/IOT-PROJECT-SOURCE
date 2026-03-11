@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+import cv2
+import smbus2 as smbus
+import time
+import math
+import RPi.GPIO as GPIO
+from scipy.spatial import distance
+from RPLCD.i2c import CharLCD
+import serial
+import sys
+import requests   # <-- NEW
+
+# ===============================
+# ----------- FIREBASE CONFIG ---
+# ===============================
+FIREBASE_URL = "https://vision-enhance-safety-platform-default-rtdb.firebaseio.com/vehicle_data.json"
+
+def send_to_firebase(data):
+    try:
+        r = requests.post(FIREBASE_URL, json=data)
+        if r.status_code == 200:
+            print("[FB] Data uploaded:", r.json())
+        else:
+            print("[FB] Error:", r.status_code, r.text)
+    except Exception as e:
+        print("[FB] Exception:", e)
+
+# ===============================
+# ----------- SMS CONFIG --------
+# ===============================
+UART_PORT = '/dev/serial0'
+BAUD = 115200
+PHONE_NUMBER = '+918122735200'
+LOCATION = "11.3628, 77.8279"
+MAP_LINK = "https://maps.app.goo.gl/jANYPc3NRyoTDEg66"
+
+def open_serial(port, baud, timeout=1):
+    try:
+        ser = serial.Serial(port, baud, timeout=timeout)
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        return ser
+    except:
+        return None
+
+def at_cmd(ser, cmd, wait=1.0):
+    if ser is None:
+        return None
+    ser.write((cmd + '\r\n').encode())
+    time.sleep(wait)
+    return ser.read_all().decode(errors='ignore')
+
+def send_sms(ser, phone, text):
+    if ser is None:
+        return False
+    at_cmd(ser, 'AT+CMGF=1')
+    at_cmd(ser, f'AT+CMGS="{phone}"')
+    ser.write((text + chr(26)).encode())
+    time.sleep(3)
+    print("[OK] SMS sent")
+    return True
+
+# ===============================
+# -------- GPIO SETUP -----------
+# ===============================
+GPIO.setmode(GPIO.BCM)
+RELAY_PIN = 17
+MQ3_PIN = 27
+BUZZER_PIN = 21
+GPIO_TRIG = 11
+GPIO_ECHO = 24
+
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.setup(MQ3_PIN, GPIO.IN)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+GPIO.setup(GPIO_TRIG, GPIO.OUT)
+GPIO.setup(GPIO_ECHO, GPIO.IN)
+GPIO.output(GPIO_TRIG, GPIO.LOW)
+time.sleep(2)
+
+lcd = CharLCD('PCF8574', 0x27)
+lcd.clear()
+lcd.write_string("Initializing...")
+
+# MPU6050
+MPU6050_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+bus = smbus.SMBus(1)
+bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)
+
+def read_raw_data(addr):
+    high = bus.read_byte_data(MPU6050_ADDR, addr)
+    low = bus.read_byte_data(MPU6050_ADDR, addr + 1)
+    value = (high << 8) | low
+    if value > 32768:
+        value -= 65536
+    return value
+
+def measure_distance():
+    GPIO.output(GPIO_TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(GPIO_TRIG, False)
+    start_time = time.time()
+    while GPIO.input(GPIO_ECHO) == 0:
+        start_time = time.time()
+    while GPIO.input(GPIO_ECHO) == 1:
+        bounce_back = time.time()
+    pulse_duration = bounce_back - start_time
+    distance = pulse_duration * 17150
+    return round(distance, 2)
+
+# Camera Setup
+cap = cv2.VideoCapture(0)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+
+def Detect_Eye(eye):
+    (ex, ey, ew, eh) = eye
+    top = (ex + ew//2, ey)
+    bottom = (ex + ew//2, ey + eh)
+    left = (ex, ey + eh//2)
+    right = (ex + ew, ey + eh//2)
+    return distance.euclidean(top, bottom) / max(distance.euclidean(left, right), 1)
+
+def countdown_alert():
+    for i in range(10, -1, -1):
+        lcd.clear()
+        lcd.write_string(f"ALERT!\nCountdown: {i}")
+        GPIO.output(BUZZER_PIN, GPIO.LOW)   # buzzer ON
+        time.sleep(0.5)
+        GPIO.output(BUZZER_PIN, GPIO.HIGH)  # buzzer OFF
+        time.sleep(0.5)
+
+# ===============================
+# ---------- MAIN LOOP ---------
+# ===============================
+lcd.clear()
+lcd.write_string("System Active")
+ser = open_serial(UART_PORT, BAUD)
+
+try:
+    while True:
+        alerts = []
+        ultrasonic_alert = False
+
+        # ---------------- Alcohol Detection ----------------
+        alcohol_detected = (GPIO.input(MQ3_PIN) == GPIO.HIGH)
+        if alcohol_detected:
+            alerts.append("Alcohol Detected!")
+
+        # ---------------- Accident Detection ----------------
+        acc_x = read_raw_data(0x3B)/16384.0
+        acc_y = read_raw_data(0x3D)/16384.0
+        acc_z = read_raw_data(0x3F)/16384.0
+        total_acc = math.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+        accident_detected = total_acc > 2.0
+        if accident_detected:
+            alerts.append("Accident Detected!")
+
+        # ---------------- Ultrasonic Detection ---------------
+        distance_cm = measure_distance()
+        if distance_cm < 10:
+            ultrasonic_alert = True
+
+        # ---------------- Drowsy Detection -------------------
+        ret, frame = cap.read()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5)
+        status = "Normal"
+        drowsy_detected = False
+        for (x, y, w, h) in faces:
+            roi = gray[y:y+h, x:x+w]
+            eyes = eye_cascade.detectMultiScale(roi, 1.1, 5)
+            if len(eyes) >= 2:
+                ear_list = [Detect_Eye(e) for e in eyes]
+                if sum(ear_list)/len(ear_list) < 0.28:
+                    status = "Drowsy"
+            else:
+                status = "Drowsy"
+        if status == "Drowsy":
+            drowsy_detected = True
+            alerts.append("Driver Drowsy!")
+
+        # ---------------- SEND DATA TO FIREBASE --------------
+        fb_data = {
+            "alcohol": "Yes" if alcohol_detected else "No",
+            "accident": "Yes" if accident_detected else "No",
+            "drowsy": "Yes" if drowsy_detected else "No",
+            "distance_cm": distance_cm,
+            "ultrasonic_alert": ultrasonic_alert,
+            "total_acc_g": round(total_acc, 2),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        send_to_firebase(fb_data)
+
+        # ---------------- HANDLE ALERTS LOCALLY --------------
+        if alerts:
+            lcd.clear()
+            lcd.write_string(alerts[0])
+            sms_text = (
+                "⚠️ Vehicle Safety Alert!\n\n"
+                "Event Detected:\n"
+                + "\n".join(alerts) +
+                "\n\nDriver may be in danger 🚨\n\n"
+                f"📍Location:\n{LOCATION}\n"
+                f"{MAP_LINK}\n\n"
+                "Please take immediate action!"
+            )
+            send_sms(ser, PHONE_NUMBER, sms_text)
+            countdown_alert()
+            GPIO.output(RELAY_PIN, GPIO.HIGH)   # stop engine after countdown
+
+        elif ultrasonic_alert:
+            lcd.clear()
+            lcd.write_string(f"Obstacle {distance_cm}cm")
+            GPIO.output(BUZZER_PIN, GPIO.LOW)   # buzzer on
+            GPIO.output(RELAY_PIN, GPIO.LOW)    # engine stays on
+
+        else:
+            lcd.clear()
+            lcd.write_string(f"Safe {distance_cm}cm")
+            GPIO.output(RELAY_PIN, GPIO.LOW)
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)
+
+        cv2.imshow("Driver Monitor", frame)
+        if cv2.waitKey(10) & 0xFF == 27:
+            break
+        time.sleep(0.5)
+
+except KeyboardInterrupt:
+    print("Program stopped by user")
+
+finally:
+    GPIO.output(RELAY_PIN, GPIO.LOW)
+    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+    GPIO.cleanup()
+    cap.release()
+    cv2.destroyAllWindows()
+    lcd.clear()
+    lcd.write_string("System Stopped")
+    if ser:
+        ser.close()

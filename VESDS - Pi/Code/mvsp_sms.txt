@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+# ==========================================================
+# SIM808L SMS + GPS helper for Raspberry Pi
+# Used by safety_system.py -> send_alert_sms(phone_number, alcohol, accident, distance_cm, total_g)
+# - Tries GPS first
+# - If GPS not available, uses default LOCATION + MAP_LINK
+# - No prints (silent)
+# ==========================================================
+
+import time
+import serial
+
+SIM808_PORT = "/dev/serial0"
+SIM808_BAUD = 9600
+
+# Default fallback location
+LOCATION = "11.3628, 77.8279"
+MAP_LINK = "https://maps.app.goo.gl/jANYPc3NRyoTDEg66"
+
+def open_modem():
+    ser = serial.Serial(SIM808_PORT, SIM808_BAUD, timeout=1, write_timeout=1)
+    time.sleep(0.5)
+    return ser
+
+def send_at(ser, cmd, timeout=2):
+    """Send an AT command and return the full response as string (no prints)."""
+    ser.write((cmd + "\r").encode())
+    time.sleep(0.3)
+    out = ""
+    end = time.time() + timeout
+    while time.time() < end:
+        if ser.in_waiting:
+            out += ser.read(ser.in_waiting).decode(errors="ignore")
+        time.sleep(0.05)
+    return out
+
+def get_gps_location(ser):
+    """
+    Returns (lat, lon) from SIM808 if GPS fix is available, else (None, None).
+    If fails, caller will use default location.
+    """
+    try:
+        send_at(ser, "AT+CGNSPWR=1", timeout=2)
+        time.sleep(2)
+        resp = send_at(ser, "AT+CGNSINF", timeout=3)
+
+        for line in resp.splitlines():
+            line = line.strip()
+            if line.startswith("+CGNSINF:"):
+                parts = line.split(",")
+                if len(parts) > 5:
+                    fix = parts[1].strip()
+                    lat = parts[3].strip()
+                    lon = parts[4].strip()
+                    if fix != "0" and lat and lon:
+                        return lat, lon
+    except Exception:
+        pass
+
+    return None, None
+
+def send_sms(ser, phone_number, message):
+    """
+    Low-level SMS send, in TEXT mode (no debug prints).
+    """
+    send_at(ser, "AT", timeout=2)
+    send_at(ser, "ATE0", timeout=2)          # echo off
+    send_at(ser, "AT+CMGF=1", timeout=2)     # text mode
+    send_at(ser, 'AT+CSCS="GSM"', timeout=2)
+
+    # Start SMS
+    ser.write((f'AT+CMGS="{phone_number}"\r').encode())
+    time.sleep(0.5)
+
+    # Message body
+    ser.write(message.encode())
+    time.sleep(0.5)
+
+    # Ctrl+Z to send
+    ser.write(bytes([26]))
+    time.sleep(5)
+
+def build_sms(alcohol, accident, distance_cm, total_g, lat, lon):
+    """
+    Build final SMS text.
+    """
+    msg = "SAFETY ALERT!\n"
+    msg += f"Alcohol: {'YES' if alcohol else 'NO'}\n"
+    msg += f"Accident: {'YES' if accident else 'NO'}\n"
+    msg += f"G-Force: {total_g:.2f} g\n"
+    if distance_cm is not None:
+        msg += f"Distance: {distance_cm:.1f} cm\n"
+
+    if lat and lon:
+        map_link = f"https://maps.google.com/?q={lat},{lon}"
+        msg += "Location:\n" + map_link
+    else:
+        msg += "Location (default):\n"
+        msg += MAP_LINK + "\n"
+        msg += f"Coords: {LOCATION}"
+
+    return msg
+
+def send_alert_sms(phone_number, alcohol, accident, distance_cm, total_g):
+    """
+    Function called from safety_system.py (runs possibly in a thread).
+    Completely silent (no prints).
+    """
+    ser = None
+    try:
+        ser = open_modem()
+        lat, lon = get_gps_location(ser)
+        message = build_sms(alcohol, accident, distance_cm, total_g, lat, lon)
+        send_sms(ser, phone_number, message)
+    except Exception:
+        # Silent fail – no prints
+        pass
+    finally:
+        if ser is not None and ser.is_open:
+            ser.close()

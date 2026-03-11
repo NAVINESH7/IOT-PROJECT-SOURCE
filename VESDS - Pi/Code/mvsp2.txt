@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+# ==========================================================
+# DROWSINESS + MPU6050 + MQ3 + I2C LCD + RELAY + BUZZER + ULTRASONIC + SMS
+#
+# Triggers (any of these):
+#   - Alcohol detected (MQ3)
+#   - Accident (high G-force from MPU6050)
+#   - Drowsiness (camera: "Sleeping" from Haar + EAR logic)
+#
+# Effects:
+#   -> SMS sent immediately (background thread, silent)
+#   -> Buzzer ON continuously
+#   -> Countdown 10..0 (LCD + serial)
+#   -> Relay OFF (engine cut), buzzer OFF
+#
+# Ultrasonic (object <= 10 cm, when SAFE):
+#   -> Show "DRIVING CLOSE"
+#   -> 3 buzzer beeps (active-LOW), 1.5 s apart
+#   -> DOES NOT turn off relay
+# ==========================================================
+
+import time
+import math
+import threading
+
+import cv2
+from scipy.spatial import distance
+import RPi.GPIO as GPIO
+from smbus2 import SMBus
+from RPLCD.i2c import CharLCD
+
+from sim808_sms import send_alert_sms   # SIM808 SMS helper
+
+# ==========================
+# CONFIG
+# ==========================
+I2C_BUS = 1
+MPU_ADDRESS = 0x68
+LCD_ADDRESS = 0x27
+
+MQ3_DO_PIN = 17       # MQ3 digital output (active-LOW)
+RELAY_PIN  = 18       # Relay control pin (engine cut)
+BUZZER_PIN = 22       # Buzzer pin (ACTIVE-LOW)
+
+ULTRA_TRIG = 23       # Ultrasonic TRIG
+ULTRA_ECHO = 24       # Ultrasonic ECHO
+
+ACCIDENT_THRESHOLD = 2.5       # g-force
+DISTANCE_LIMIT_CM = 10.0       # warning if <= 10 cm
+
+ALERT_PHONE_NUMBER = "+911234567890"   # <-- PUT YOUR PHONE NUMBER HERE
+
+# Relay logic (ACTIVE-LOW relay)
+RELAY_ON  = GPIO.LOW
+RELAY_OFF = GPIO.HIGH
+
+bus = SMBus(I2C_BUS)
+
+# ==========================
+# GPIO SETUP
+# ==========================
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+GPIO.setup(MQ3_DO_PIN, GPIO.IN)
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+
+GPIO.setup(ULTRA_TRIG, GPIO.OUT)
+GPIO.setup(ULTRA_ECHO, GPIO.IN)
+
+GPIO.output(RELAY_PIN, RELAY_ON)      # Engine ON
+GPIO.output(BUZZER_PIN, GPIO.HIGH)    # Buzzer OFF (active-LOW)
+GPIO.output(ULTRA_TRIG, GPIO.LOW)
+
+# ==========================
+# MPU6050 REGISTERS
+# ==========================
+PWR_MGMT_1   = 0x6B
+ACCEL_XOUT_H = 0x3B
+
+# Wake MPU6050
+bus.write_byte_data(MPU_ADDRESS, PWR_MGMT_1, 0)
+time.sleep(0.5)
+
+# ==========================
+# CAMERA + HAAR CASCADES (YOUR DROWSY LOGIC)
+# ==========================
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("WARNING: Cannot open camera. Drowsy detection disabled.")
+    cap = None
+
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+eye_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_eye.xml"
+)
+
+# Your EAR calc using bounding box
+def Detect_Eye(eye):
+    (ex, ey, ew, eh) = eye
+    top = (ex + ew // 2, ey)
+    bottom = (ex + ew // 2, ey + eh)
+    left = (ex, ey + eh // 2)
+    right = (ex + ew, ey + eh // 2)
+
+    poi_A = distance.euclidean(top, bottom)
+    poi_C = distance.euclidean(left, right)
+
+    if poi_C == 0:
+        return 1.0
+    aspect_ratio_Eye = poi_A / poi_C
+    return aspect_ratio_Eye
+
+# ==========================
+# FUNCTIONS FOR MPU + ULTRASONIC
+# ==========================
+def read_word(addr):
+    high = bus.read_byte_data(MPU_ADDRESS, addr)
+    low  = bus.read_byte_data(MPU_ADDRESS, addr+1)
+    return (high << 8) + low
+
+def read_word_2c(addr):
+    val = read_word(addr)
+    if val >= 0x8000:
+        return -((65535 - val) + 1)
+    return val
+
+def get_accel_g():
+    ax = read_word_2c(ACCEL_XOUT_H)      / 16384.0
+    ay = read_word_2c(ACCEL_XOUT_H + 2)  / 16384.0
+    az = read_word_2c(ACCEL_XOUT_H + 4)  / 16384.0
+    return ax, ay, az
+
+def get_distance_cm():
+    """Measure distance from HC-SR04 in cm. Returns None on timeout."""
+    GPIO.output(ULTRA_TRIG, GPIO.LOW)
+    time.sleep(0.0002)
+
+    GPIO.output(ULTRA_TRIG, GPIO.HIGH)
+    time.sleep(0.00001)
+    GPIO.output(ULTRA_TRIG, GPIO.LOW)
+
+    timeout = time.time() + 0.02  # 20 ms
+    while GPIO.input(ULTRA_ECHO) == 0:
+        pulse_start = time.time()
+        if pulse_start > timeout:
+            return None
+
+    timeout = time.time() + 0.02
+    while GPIO.input(ULTRA_ECHO) == 1:
+        pulse_end = time.time()
+        if pulse_end > timeout:
+            return None
+
+    pulse_duration = pulse_end - pulse_start
+    distance = (pulse_duration * 34300) / 2.0   # cm
+    return distance
+
+# ==========================
+# LCD INIT
+# ==========================
+lcd = CharLCD('PCF8574', LCD_ADDRESS, cols=16, rows=2)
+lcd.clear()
+lcd.write_string("System Ready")
+time.sleep(1)
+
+cut_done = False
+sms_sent = False
+sms_thread = None
+
+print("System running...")
+
+# ==========================
+# MAIN LOOP
+# ==========================
+try:
+    while True:
+        # --- DROWSINESS DETECTION (YOUR EXACT LOGIC) ---
+        drowsy = False
+        if cap is not None:
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.resize(frame, (640, 480))
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                faces = face_cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(60,60)
+                )
+                print("Faces detected:", len(faces))
+
+                status_cam = "Looking Good"
+
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                    roi_gray = gray[y:y+h, x:x+w]
+                    roi_color = frame[y:y+h, x:x+w]
+
+                    eyes = eye_cascade.detectMultiScale(
+                        roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(20,20)
+                    )
+                    print("Eyes detected:", len(eyes))
+                    ear_list = []
+
+                    for (ex, ey, ew, eh) in eyes:
+                        cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 0), 2)
+                        eye_box = (ex, ey, ew, eh)
+                        ear = Detect_Eye(eye_box)
+                        ear_list.append(ear)
+
+                    if len(ear_list) >= 2:
+                        Eye_Rat = sum(ear_list) / len(ear_list)
+                        Eye_Rat = round(Eye_Rat, 2)
+                        print("EAR:", Eye_Rat)
+
+                        if Eye_Rat < 0.25:
+                            status_cam = "Sleeping"
+                    else:
+                        # Not enough eyes detected → treat as sleeping
+                        status_cam = "Sleeping"
+
+                # Show status on camera frame
+                cv2.putText(
+                    frame, status_cam, (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (0, 0, 255) if status_cam == "Sleeping" else (0, 255, 0), 2
+                )
+                cv2.imshow("Drowsiness Detection", frame)
+                cv2.waitKey(1)
+
+                drowsy = (status_cam == "Sleeping")
+            else:
+                drowsy = False
+
+        # --- Read MPU6050 & MQ3 & Ultrasonic ---
+        ax, ay, az = get_accel_g()
+        total_g = math.sqrt(ax*ax + ay*ay + az*az)
+
+        alcohol  = (GPIO.input(MQ3_DO_PIN) == 0)       # active-LOW
+        accident = (total_g >= ACCIDENT_THRESHOLD)
+
+        distance_cm = get_distance_cm()
+
+        print(
+            f"G={total_g:.2f} | Alcohol={alcohol} "
+            f"Accident={accident} Drowsy={drowsy} | "
+            f"Dist={distance_cm if distance_cm is not None else 'None'}"
+        )
+
+        # --- If already cut engine, keep OFF and exit loop ---
+        if cut_done:
+            GPIO.output(RELAY_PIN, RELAY_OFF)
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)   # buzzer OFF
+            lcd.clear()
+            lcd.write_string("ENGINE OFF")
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string("RELAY CUT")
+            time.sleep(1)
+            break
+
+        # ========= COMBINED ALERT LOGIC =========
+        if alcohol or accident or drowsy:
+            reasons = []
+            if accident:
+                reasons.append("ACC")
+            if alcohol:
+                reasons.append("ALC")
+            if drowsy:
+                reasons.append("DROW")
+            reason = "+".join(reasons) if reasons else "ALERT"
+
+            print("DETECTED:", reason)
+
+            # ---- SEND SMS IN PARALLEL (BACKGROUND THREAD), SILENT INSIDE ----
+            if not sms_sent:
+                sms_sent = True
+
+                def sms_job():
+                    # pass drowsy separately now
+                    send_alert_sms(
+                        phone_number=ALERT_PHONE_NUMBER,
+                        alcohol=alcohol,
+                        accident=accident,
+                        drowsy=drowsy,
+                        distance_cm=distance_cm,
+                        total_g=total_g
+                    )
+
+                sms_thread = threading.Thread(target=sms_job, daemon=True)
+                sms_thread.start()
+
+            # Buzzer ON continuously (active-LOW)
+            GPIO.output(BUZZER_PIN, GPIO.LOW)
+
+            # Countdown 10 -> 0
+            for sec in range(10, -1, -1):
+                lcd.clear()
+                lcd.write_string(f"{reason} DETECT")
+                lcd.cursor_pos = (1, 0)
+                lcd.write_string(f"OFF IN {sec:2d}s")
+                print("COUNTDOWN:", sec)
+                time.sleep(1)
+
+            # After countdown, ensure SMS thread is finished
+            if sms_thread is not None:
+                sms_thread.join(timeout=5.0)
+
+            print("SMS alert process finished (check your phone).")
+
+            # Cut engine
+            GPIO.output(RELAY_PIN, RELAY_OFF)
+            cut_done = True
+
+            lcd.clear()
+            lcd.write_string("ENGINE OFF")
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string("RELAY CUT")
+            print("ENGINE CUT - RELAY OFF")
+
+            # Buzzer OFF after cut
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)
+            time.sleep(3)
+
+        else:
+            # ========= SAFE STATE =========
+            GPIO.output(RELAY_PIN, RELAY_ON)
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)   # OFF (active-LOW)
+
+            # Check ultrasonic only in SAFE mode
+            if distance_cm is not None and distance_cm <= DISTANCE_LIMIT_CM:
+                # Object is too close -> 3 warning beeps
+                for i in range(3):
+                    lcd.clear()
+                    lcd.write_string("DRIVING CLOSE")
+                    lcd.cursor_pos = (1, 0)
+                    if distance_cm is not None:
+                        lcd.write_string(f"D={distance_cm:4.1f}cm")
+                    else:
+                        lcd.write_string("D= --.- cm")
+
+                    print(f"Ultrasonic WARN {i+1}/3, Dist={distance_cm:.1f} cm")
+
+                    GPIO.output(BUZZER_PIN, GPIO.LOW)
+                    time.sleep(0.3)
+
+                    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+                    time.sleep(1.2)   # 0.3 + 1.2 = 1.5 s between starts
+            else:
+                lcd.clear()
+                lcd.write_string("Status: SAFE")
+                lcd.cursor_pos = (1, 0)
+                lcd.write_string("Relay: ON")
+                time.sleep(0.5)
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    GPIO.output(RELAY_PIN, RELAY_OFF)
+    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+    lcd.clear()
+    lcd.write_string("SYSTEM STOP")
+    time.sleep(1)
+    lcd.clear()
+    GPIO.cleanup()
+    bus.close()
+    if cap is not None:
+        cap.release()
+    cv2.destroyAllWindows()
+    print("Program Ended")
