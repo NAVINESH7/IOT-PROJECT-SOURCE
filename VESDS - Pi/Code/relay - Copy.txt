@@ -1,0 +1,31 @@
+import RPi.GPIO as GPIO
+import time
+
+# Relay pin (same as your project)
+relay_pin = 17
+
+# Setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(relay_pin, GPIO.OUT)
+
+print("Starting Relay + Motor/Buzzer Test")
+
+try:
+    while True:
+        # Turn relay ON
+        GPIO.output(relay_pin, GPIO.LOW)   # Use LOW for active-LOW relay
+        print("Relay ON → Motor/Buzzer should run")
+        time.sleep(5)
+
+        # Turn relay OFF
+        GPIO.output(relay_pin, GPIO.HIGH)  # Use HIGH for active-LOW relay
+        print("Relay OFF → Motor/Buzzer should stop")
+        time.sleep(5)
+
+except KeyboardInterrupt:
+    print("Test stopped by user")
+
+finally:
+    GPIO.output(relay_pin, GPIO.HIGH)  # Ensure relay is OFF
+    GPIO.cleanup()
+    print("GPIO cleaned up")

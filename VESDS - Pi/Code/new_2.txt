@@ -1,0 +1,157 @@
+import smbus
+import time
+import cv2
+import RPi.GPIO as GPIO
+from RPLCD.i2c import CharLCD
+from scipy.spatial import distance
+from threading import Thread
+
+# =============================
+# LCD Setup (I2C)
+# =============================
+lcd = CharLCD('PCF8574', 0x27)  # Change address if needed
+
+# =============================
+# MPU6050 Setup
+# =============================
+bus = smbus.SMBus(1)
+MPU6050_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)  # Wake up MPU6050
+
+def read_raw_data(addr):
+    high = bus.read_byte_data(MPU6050_ADDR, addr)
+    low = bus.read_byte_data(MPU6050_ADDR, addr + 1)
+    value = (high << 8) | low
+    if value > 32768:
+        value -= 65536
+    return value
+
+# =============================
+# Relay & Buzzer Setup
+# =============================
+relay_pin = 17  # Motor + buzzer
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(relay_pin, GPIO.OUT)
+GPIO.output(relay_pin, GPIO.HIGH)  # Relay OFF by default (active LOW modules)
+
+# =============================
+# Alcohol Sensor Setup
+# =============================
+alcohol_pin = 27  # Digital input from alcohol sensor
+GPIO.setup(alcohol_pin, GPIO.IN)
+
+# =============================
+# Webcam Setup
+# =============================
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Cannot open camera. Please check webcam connection.")
+    exit()
+
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+
+def Detect_Eye(eye):
+    (ex, ey, ew, eh) = eye
+    top = (ex + ew // 2, ey)
+    bottom = (ex + ew // 2, ey + eh)
+    left = (ex, ey + eh // 2)
+    right = (ex + ew, ey + eh // 2)
+    poi_A = distance.euclidean(top, bottom)
+    poi_C = distance.euclidean(left, right)
+    return poi_A / poi_C if poi_C != 0 else 1.0
+
+# =============================
+# Function to activate relay for 10 sec
+# =============================
+def trigger_relay():
+    GPIO.output(relay_pin, GPIO.LOW)   # Relay ON (active LOW type)
+    print("Relay ON for 10 seconds")
+    time.sleep(10)
+    GPIO.output(relay_pin, GPIO.HIGH)  # Relay OFF
+    print("Relay OFF")
+
+# =============================
+# Main Loop
+# =============================
+ACCIDENT_THRESHOLD = 1.5
+
+try:
+    while True:
+        # -------- Accident Detection --------
+        acc_x = read_raw_data(ACCEL_XOUT_H) / 16384.0
+        acc_y = read_raw_data(ACCEL_XOUT_H + 2) / 16384.0
+        acc_z = read_raw_data(ACCEL_XOUT_H + 4) / 16384.0
+        total_acc = (acc_x**2 + acc_y**2 + acc_z**2) ** 0.5
+        accident_detected = abs(total_acc - 1.0) > ACCIDENT_THRESHOLD
+
+        # -------- Alcohol Detection --------
+        # FIX: MQ3 sometimes outputs LOW on detection
+        alcohol_detected = GPIO.input(alcohol_pin) == GPIO.LOW
+
+        # -------- Drowsiness Detection --------
+        ret, frame = cap.read()
+        if not ret:
+            print("Camera frame not captured")
+            break
+        frame = cv2.resize(frame, (640, 480))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=6, minSize=(80, 80)
+        )
+
+        drowsy = False
+        for (x, y, w, h) in faces:
+            roi_gray = gray[y:y+h, x:x+w]
+            eyes = eye_cascade.detectMultiScale(
+                roi_gray, scaleFactor=1.1, minNeighbors=10, minSize=(25, 25)
+            )
+            ear_list = [Detect_Eye((ex, ey, ew, eh)) for (ex, ey, ew, eh) in eyes]
+
+            if len(ear_list) >= 2:
+                Eye_Rat = sum(ear_list) / len(ear_list)
+                if Eye_Rat < 0.25:
+                    drowsy = True
+            # FIX: do NOT force drowsy = True when eyes not found
+            # else: ignore this frame
+
+        # -------- Status Determination --------
+        lcd.clear()
+        if accident_detected:
+            status = "ACCIDENT 🚨"
+        elif alcohol_detected:
+            status = "ALCOHOL 🚫"
+        elif drowsy:
+            status = "DROWSY 😴"
+        else:
+            status = "ALL GOOD ✅"
+
+        print(status)
+        lcd.write_string(status)
+
+        # -------- Relay Activation --------
+        if status != "ALL GOOD ✅":
+            # Use thread so relay countdown doesn't block webcam feed
+            Thread(target=trigger_relay).start()
+
+        # -------- Show webcam frame --------
+        cv2.putText(
+            frame, status, (50, 50), cv2.FONT_HERSHEY_SIMPLEX,
+            1, (0, 0, 255) if status != "ALL GOOD ✅" else (0, 255, 0), 2
+        )
+        cv2.imshow("Driver Monitoring", frame)
+
+        if cv2.waitKey(10) & 0xFF == 27:  # ESC key
+            break
+
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    GPIO.cleanup()
+    cap.release()
+    cv2.destroyAllWindows()
+    lcd.clear()

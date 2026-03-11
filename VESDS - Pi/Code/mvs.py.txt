@@ -1,0 +1,163 @@
+import serial
+import time
+import RPi.GPIO as GPIO
+
+# Constants
+UART_PORT = '/dev/serial0'  # UART port on Raspberry Pi
+BAUD_RATES = [115200, 9600]  # Try multiple baud rates
+PWRKEY_PIN = 18            # GPIO pin for A9G PWRKEY
+PHONE_NUMBER = '+918122735200'  # Target phone number
+SMS_MESSAGE = 'Hiiii...This is from pi'  # Message to send
+DEFAULT_SMSC = '+919823000001'  # Default for Airtel India; change for your carrier
+
+# Setup GPIO for PWRKEY
+print("Setting up GPIO...")
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(PWRKEY_PIN, GPIO.OUT)
+GPIO.output(PWRKEY_PIN, GPIO.HIGH)  # Idle high
+print("GPIO setup complete.")
+
+def power_on_module():
+    """Power on A9G by pulsing PWRKEY low."""
+    print("Powering on A9G...")
+    GPIO.output(PWRKEY_PIN, GPIO.LOW)
+    time.sleep(2)  # Hold for 2 seconds
+    GPIO.output(PWRKEY_PIN, GPIO.HIGH)
+    time.sleep(10)  # Wait for boot
+    print("A9G power on complete.")
+
+def send_at_command(ser, command, wait_time=3, expected='OK'):
+    """Send AT command and check response with buffer flush."""
+    ser.flushInput()
+    ser.flushOutput()
+    print(f"Sending command: {command}")
+    ser.write((command + '\r\n').encode())
+    time.sleep(wait_time)
+    response = ser.read(ser.in_waiting or 1024).decode('utf-8', errors='ignore').strip()
+    print(f"Raw Response: {repr(response)}")
+    print(f"Command: {command} | Response: {response}")
+    return response, expected in response
+
+def open_serial(baud_rate):
+    """Open serial port with given baud rate."""
+    try:
+        ser = serial.Serial(UART_PORT, baud_rate, timeout=5)
+        time.sleep(2)
+        ser.flushInput()
+        ser.flushOutput()
+        return ser
+    except serial.SerialException as e:
+        print(f"Failed to open serial at {baud_rate}: {e}")
+        return None
+
+def init_gsm(ser):
+    """Initialize GSM for SMS."""
+    print("Initializing GSM...")
+    # Check module
+    response, success = send_at_command(ser, 'AT')
+    if not success:
+        raise Exception(f"Module not responding. AT Response: {response}")
+    
+    # Disable echo
+    send_at_command(ser, 'ATE0')
+    
+    # Enable verbose errors
+    send_at_command(ser, 'AT+CMEE=1')
+    
+    # Check SIM status
+    response, _ = send_at_command(ser, 'AT+CPIN?')
+    if '+CPIN: READY' not in response:
+        raise Exception(f"SIM not ready. CPIN Response: {response}")
+    
+    # Set SMS text mode
+    send_at_command(ser, 'AT+CMGF=1')
+    
+    # Check and set SMS service center if needed
+    response, _ = send_at_command(ser, 'AT+CSCA?')
+    if not response or '+CSCA:' not in response:
+        print("SMSC not set, setting default...")
+        send_at_command(ser, f'AT+CSCA="{DEFAULT_SMSC}"')
+        print("SMSC set successfully.")
+    
+    # Verify network registration
+    response, _ = send_at_command(ser, 'AT+CREG?', 1)
+    if '+CREG: 1,1' not in response and '+CREG: 0,5' not in response:
+        raise Exception(f"Network registration failed. CREG Response: {response}")
+    
+    # Check signal strength
+    response, _ = send_at_command(ser, 'AT+CSQ')
+    print(f"Signal Strength: {response}")
+
+def send_sms(ser, phone, message):
+    """Send SMS to the specified number with retry."""
+    print(f"Sending SMS to {phone}: {message}")
+    for attempt in range(2):  # Retry once
+        # Set recipient
+        response, _ = send_at_command(ser, f'AT+CMGS="{phone}"', 1)
+        if '>' not in response:
+            raise Exception(f"Failed to initiate SMS. Response: {response}")
+        time.sleep(1)
+        # Send message with Ctrl+Z
+        ser.write((message + chr(26)).encode())
+        time.sleep(5)
+        response = ser.read(ser.in_waiting or 1024).decode('utf-8', errors='ignore').strip()
+        print(f"SMS Response: {repr(response)}")
+        if 'OK' in response or '+CMGS:' in response:
+            print("SMS sent successfully!")
+            return
+        else:
+            print(f"SMS attempt {attempt+1} failed, retrying...")
+            time.sleep(2)
+    raise Exception(f"SMS send failed after retries. Final Response: {response}")
+
+def main():
+    ser = None
+    try:
+        print("Starting main...")
+        # Power on the module
+        power_on_module()
+
+        # Try different baud rates
+        baud_rate = None
+        for br in BAUD_RATES:
+            print(f"Trying baud rate: {br}")
+            ser = open_serial(br)
+            if ser:
+                response, success = send_at_command(ser, 'AT', wait_time=2)
+                if success:
+                    baud_rate = br
+                    break
+                else:
+                    ser.close()
+                    ser = None
+            time.sleep(1)
+        
+        if not ser:
+            raise Exception("Failed to connect at any baud rate. Check wiring/power.")
+        
+        print(f"Connected to {UART_PORT} at {baud_rate} baud.")
+
+        # Initialize GSM
+        init_gsm(ser)
+
+        # Send SMS
+        send_sms(ser, PHONE_NUMBER, SMS_MESSAGE)
+        print("Script completed successfully!")
+
+    except serial.SerialException as se:
+        print(f"Serial port error: {se}. Check if /dev/serial0 exists (ls /dev/serial*) and run with sudo.")
+    except Exception as e:
+        print(f"Error in main: {e}")
+    finally:
+        # Cleanup
+        if ser:
+            try:
+                ser.close()
+                print("Serial port closed.")
+            except:
+                pass
+        GPIO.cleanup()
+        print("GPIO cleaned up.")
+
+if __name__ == "__main__":
+    main()

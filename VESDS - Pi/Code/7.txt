@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# ==========================================================
+# Vision Enhanced Safety Platform (IOT2_H - Final Optimized)
+# Raspberry Pi 4 + MPU6050 + MQ3 + Ultrasonic + Camera + LCD + Buzzer + Relay
+# ==========================================================
+
+import cv2
+import smbus2 as smbus
+import time
+import math
+import RPi.GPIO as GPIO
+from scipy.spatial import distance
+from RPLCD.i2c import CharLCD
+import requests
+import os
+
+# ===============================
+# -------- FIREBASE CONFIG -------
+# ===============================
+FIREBASE_URL = "https://vision-enhance-safety-platform-default-rtdb.firebaseio.com"
+DATABASE_SECRET = "HaZbsYJWnOiBipSR751tHgPTwd5cY4ZB5Ctilu2G"
+
+def upload_to_firebase(data):
+    """Uploads sensor and alert data to Firebase with timestamp key."""
+    try:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        timestamp_key = time.strftime("%Y%m%d_%H%M%S")
+        payload = {"timestamp": timestamp, **data}
+
+        log_url = f"{FIREBASE_URL}/VehicleData/logs/{timestamp_key}.json?auth={DATABASE_SECRET}"
+        requests.put(log_url, json=payload)
+
+        update_url = f"{FIREBASE_URL}/VehicleData/last_update.json?auth={DATABASE_SECRET}"
+        requests.put(update_url, json=payload)
+
+        print(f"[OK] Firebase Updated at {timestamp}")
+    except Exception as e:
+        print(f"[ERROR] Firebase upload failed: {e}")
+
+# ===============================
+# -------- GPIO & SENSOR SETUP ---
+# ===============================
+GPIO.setmode(GPIO.BCM)
+RELAY_PIN = 17
+MQ3_PIN = 27
+BUZZER_PIN = 21
+GPIO_TRIG = 11
+GPIO_ECHO = 24
+
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.setup(MQ3_PIN, GPIO.IN)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+GPIO.setup(GPIO_TRIG, GPIO.OUT)
+GPIO.setup(GPIO_ECHO, GPIO.IN)
+GPIO.output(GPIO_TRIG, GPIO.LOW)
+
+GPIO.output(RELAY_PIN, GPIO.LOW)   # Motor ON (active low)
+GPIO.output(BUZZER_PIN, GPIO.HIGH) # Buzzer OFF
+time.sleep(2)
+
+lcd = CharLCD('PCF8574', 0x27)
+lcd.clear()
+lcd.write_string("System Starting...")
+
+# ===============================
+# -------- MPU6050 SETUP ---------
+# ===============================
+MPU6050_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+ACCEL_YOUT_H = 0x3D
+ACCEL_ZOUT_H = 0x3F
+
+bus = smbus.SMBus(1)
+bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)
+
+def read_raw_data(addr):
+    high = bus.read_byte_data(MPU6050_ADDR, addr)
+    low = bus.read_byte_data(MPU6050_ADDR, addr + 1)
+    value = ((high << 8) | low)
+    if value > 32768:
+        value -= 65536
+    return value
+
+def get_accel_g():
+    acc_x = read_raw_data(ACCEL_XOUT_H) / 16384.0
+    acc_y = read_raw_data(ACCEL_YOUT_H) / 16384.0
+    acc_z = read_raw_data(ACCEL_ZOUT_H) / 16384.0
+    total_acc = math.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+    return total_acc
+
+ACCIDENT_THRESHOLD = 1.6  # Easier trigger
+print("Calibrating MPU6050... hold still.")
+baseline_g = get_accel_g()
+print(f"Baseline G: {baseline_g:.2f}g (normal)")
+
+# ===============================
+# ------- ULTRASONIC SENSOR -----
+# ===============================
+def measure_distance():
+    GPIO.output(GPIO_TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(GPIO_TRIG, False)
+    start_time = time.time()
+    while GPIO.input(GPIO_ECHO) == 0:
+        start_time = time.time()
+    while GPIO.input(GPIO_ECHO) == 1:
+        bounce_back_time = time.time()
+    pulse_duration = bounce_back_time - start_time
+    distance = pulse_duration * 17150
+    if distance <= 2 or distance > 400:
+        distance = 400.0
+    return round(distance, 2)
+
+# ===============================
+# -------- CAMERA SETUP ----------
+# ===============================
+try:
+    haar_path = cv2.data.haarcascades
+except AttributeError:
+    haar_path = "/home/admin/project/env/lib/python3.13/site-packages/cv2/data/"
+
+face_cascade = cv2.CascadeClassifier(os.path.join(haar_path, "haarcascade_frontalface_default.xml"))
+eye_cascade = cv2.CascadeClassifier(os.path.join(haar_path, "haarcascade_eye.xml"))
+cap = cv2.VideoCapture(0)
+
+# ✅ Lower resolution for faster real-time detection
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+cap.set(cv2.CAP_PROP_FPS, 15)
+
+if not cap.isOpened():
+    print("Cannot open camera.")
+    exit()
+
+lcd.clear()
+lcd.write_string("Camera Ready...")
+
+def Detect_Eye(eye):
+    (ex, ey, ew, eh) = eye
+    top = (ex + ew // 2, ey)
+    bottom = (ex + ew // 2, ey + eh)
+    left = (ex, ey + eh // 2)
+    right = (ex + ew, ey + eh // 2)
+    poi_A = distance.euclidean(top, bottom)
+    poi_C = distance.euclidean(left, right)
+    if poi_C == 0:
+        return 1.0
+    return poi_A / poi_C
+
+# ===============================
+# ---- RELAY COUNTDOWN BLOCKING ---
+# ===============================
+def relay_shutdown_countdown(alert_type):
+    """Block system while counting down"""
+    for i in range(10, -1, -1):
+        lcd.clear()
+        lcd.cursor_pos = (0, 0)
+        lcd.write_string(f"{alert_type}")
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string(f"Stop within {i}")
+        GPIO.output(BUZZER_PIN, GPIO.LOW)
+        time.sleep(1)
+    GPIO.output(RELAY_PIN, GPIO.HIGH)
+    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+    lcd.clear()
+    lcd.write_string("MOTOR STOPPED")
+
+# ===============================
+# ---------- MAIN LOOP ----------
+# ===============================
+print("System Running...")
+lcd.clear()
+lcd.write_string("MVSP Active...")
+
+try:
+    frame_count = 0
+    faces = []  # ✅ Initialize to avoid NameError
+
+    while True:
+        alert_msgs = []
+        relay_should_cut = False
+        alert_type = "SAFE"
+
+        # --- MQ3 Alcohol Detection (INVERTED) ---
+        alcohol_detected = GPIO.input(MQ3_PIN) == GPIO.HIGH
+        if alcohol_detected:
+            alert_type = "ALCOHOL DETECTED"
+            relay_should_cut = True
+
+        # --- Accident Detection ---
+        total_acc = get_accel_g()
+        if total_acc > ACCIDENT_THRESHOLD:
+            alert_type = f"ACCIDENT {total_acc:.2f}g"
+            relay_should_cut = True
+
+        # --- Ultrasonic Obstacle Detection ---
+        distance_cm = measure_distance()
+        if distance_cm < 10:
+            alert_type = "DRIVING CLOSE"
+            lcd.clear()
+            lcd.write_string("Driving Close")
+            GPIO.output(BUZZER_PIN, GPIO.LOW)
+            time.sleep(0.5)
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)
+
+        # --- Clear camera buffer for real-time view ---
+        for _ in range(3):
+            cap.grab()
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.resize(frame, (320, 240))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_count += 1
+
+        # --- Optimized Haar Detection (every 5th frame) ---
+        if frame_count % 5 == 0:
+            faces = face_cascade.detectMultiScale(gray, 1.2, 4, minSize=(40, 40))
+
+        status = "Normal"
+
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            roi_gray = gray[y:y+h, x:x+w]
+            roi_color = frame[y:y+h, x:x+w]
+            eyes = eye_cascade.detectMultiScale(roi_gray, 1.2, 4, minSize=(20, 20))
+            for (ex, ey, ew, eh) in eyes:
+                cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), (0, 255, 0), 2)
+            ear_list = [Detect_Eye(e) for e in eyes]
+            if len(ear_list) >= 2:
+                Eye_Rat = sum(ear_list) / len(ear_list)
+                if Eye_Rat < 0.25:
+                    status = "Drowsy"
+            else:
+                status = "Drowsy"
+
+        if status == "Drowsy":
+            alert_type = "DROWSY DETECTED"
+            relay_should_cut = True
+
+        # --- Display Camera Visual ---
+        cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (0, 0, 255) if status != "Normal" else (0, 255, 0), 2)
+        cv2.imshow("Driver Monitor", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+        # --- Firebase Update ---
+        data_packet = {
+            "alcohol": bool(alcohol_detected),
+            "accident_gforce": round(total_acc, 2),
+            "distance_cm": distance_cm,
+            "driver_status": status,
+            "alert_message": alert_type
+        }
+        upload_to_firebase(data_packet)
+
+        # --- LCD / RELAY / BUZZER HANDLING ---
+        if relay_should_cut:
+            relay_shutdown_countdown(alert_type)
+        else:
+            GPIO.output(RELAY_PIN, GPIO.LOW)
+            lcd.clear()
+            lcd.write_string("SAFE")
+
+        time.sleep(1)  # 1s Firebase update interval
+
+except KeyboardInterrupt:
+    print("\nProgram stopped by user.")
+
+finally:
+    GPIO.output(RELAY_PIN, GPIO.HIGH)
+    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+    GPIO.cleanup()
+    cap.release()
+    cv2.destroyAllWindows()
+    lcd.clear()
+    lcd.write_string("System Stopped.")
+    print("GPIO cleaned up, system stopped.")

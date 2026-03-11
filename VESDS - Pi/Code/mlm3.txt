@@ -1,0 +1,69 @@
+import smbus
+import time
+import RPi.GPIO as GPIO
+from RPLCD.i2c import CharLCD
+
+# ---------------------------
+# GPIO Setup for MQ3
+# ---------------------------
+MQ3_PIN = 17  # GPIO17 (Pin 11)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(MQ3_PIN, GPIO.IN)
+
+# ---------------------------
+# LCD Setup (I2C)
+# ---------------------------
+lcd = CharLCD('PCF8574', 0x27)  # Change 0x27 to 0x3F if needed
+
+# ---------------------------
+# MPU6050 Setup
+# ---------------------------
+bus = smbus.SMBus(1)
+MPU6050_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+
+bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)  # Wake MPU6050
+
+def read_raw_data(addr):
+    high = bus.read_byte_data(MPU6050_ADDR, addr)
+    low = bus.read_byte_data(MPU6050_ADDR, addr + 1)
+    value = (high << 8) | low
+    if value > 32768:
+        value -= 65536
+    return value
+
+# ---------------------------
+# Main Loop
+# ---------------------------
+ACCIDENT_THRESHOLD = 1.5  # g-force deviation threshold
+
+try:
+    while True:
+        # --- Alcohol Detection ---
+        alcohol_detected = not GPIO.input(MQ3_PIN)  
+        # (If using digital MQ3: LOW = alcohol detected, HIGH = safe. Adjust if reversed.)
+
+        # --- Accident Detection ---
+        acc_x = read_raw_data(ACCEL_XOUT_H) / 16384.0
+        acc_y = read_raw_data(ACCEL_XOUT_H + 2) / 16384.0
+        acc_z = read_raw_data(ACCEL_XOUT_H + 4) / 16384.0
+        total_acc = (acc_x**2 + acc_y**2 + acc_z**2) ** 0.5
+
+        lcd.clear()
+
+        if alcohol_detected:
+            print("ALCOHOL DETECTED 🚨")
+            lcd.write_string("ALCOHOL DETECTED")
+        elif abs(total_acc - 1.0) > ACCIDENT_THRESHOLD:
+            print("ACCIDENT DETECTED 🚨")
+            lcd.write_string("ACCIDENT DETECTED")
+        else:
+            print("SAFE ✅")
+            lcd.write_string("SAFE")
+
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    GPIO.cleanup()
+    print("Program stopped")

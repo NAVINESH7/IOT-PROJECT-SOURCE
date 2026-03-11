@@ -1,0 +1,144 @@
+# Required Libraries
+import RPi.GPIO as GPIO
+import time
+import smbus
+import cv2
+import dlib
+from scipy.spatial import distance
+
+# ---------------------------
+# GPIO Setup
+# ---------------------------
+RELAY_PIN = 17
+BUZZER_PIN = 27
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+GPIO.output(RELAY_PIN, GPIO.HIGH)  # Motor ON initially
+GPIO.output(BUZZER_PIN, GPIO.LOW)
+
+# ---------------------------
+# LCD I2C Setup (16x2)
+# ---------------------------
+from RPLCD.i2c import CharLCD
+lcd = CharLCD('PCF8574', 0x27)  # Update address if different
+
+# ---------------------------
+# MQ3 Alcohol Sensor Setup (Analog to Digital using ADC or GPIO)
+# ---------------------------
+ALCOHOL_THRESHOLD = 300  # Example value
+MQ3_PIN = 4  # Use ADC channel if analog
+
+# ---------------------------
+# MPU6050 Setup (I2C)
+# ---------------------------
+MPU_ADDR = 0x68
+bus = smbus.SMBus(1)
+bus.write_byte_data(MPU_ADDR, 0x6B, 0)  # Wake up MPU6050
+ACCIDENT_THRESHOLD = 15  # Example threshold
+
+def read_mpu6050_accel():
+    # Read accelerometer data
+    def read_word(adr):
+        high = bus.read_byte_data(MPU_ADDR, adr)
+        low = bus.read_byte_data(MPU_ADDR, adr+1)
+        val = (high << 8) + low
+        if val > 32768:
+            val -= 65536
+        return val
+
+    accel_x = read_word(0x3B) / 16384.0
+    accel_y = read_word(0x3D) / 16384.0
+    accel_z = read_word(0x3F) / 16384.0
+    return accel_x, accel_y, accel_z
+
+# ---------------------------
+# Webcam & Drowsiness Detection Setup
+# ---------------------------
+EYE_AR_THRESH = 0.25
+EYE_AR_CONSEC_FRAMES = 20
+COUNTER = 0
+
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
+def eye_aspect_ratio(eye):
+    # EAR formula
+    A = distance.euclidean(eye[1], eye[5])
+    B = distance.euclidean(eye[2], eye[4])
+    C = distance.euclidean(eye[0], eye[3])
+    ear = (A + B) / (2.0 * C)
+    return ear
+
+cap = cv2.VideoCapture(0)
+
+# ---------------------------
+# Main Loop
+# ---------------------------
+try:
+    while True:
+        # -------------------
+        # Alcohol Check
+        # -------------------
+        alcohol_value = GPIO.input(MQ3_PIN)  # Replace with ADC read if analog
+        if alcohol_value > ALCOHOL_THRESHOLD:
+            GPIO.output(RELAY_PIN, GPIO.LOW)  # Motor OFF
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)
+            lcd.clear()
+            lcd.write_string("Alcohol Detected!")
+            time.sleep(1)
+            continue
+        else:
+            GPIO.output(RELAY_PIN, GPIO.HIGH)
+            GPIO.output(BUZZER_PIN, GPIO.LOW)
+
+        # -------------------
+        # Accident Detection
+        # -------------------
+        ax, ay, az = read_mpu6050_accel()
+        if abs(ax) > ACCIDENT_THRESHOLD or abs(ay) > ACCIDENT_THRESHOLD or abs(az) > ACCIDENT_THRESHOLD:
+            lcd.clear()
+            lcd.write_string("Accident Detected!")
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)
+            time.sleep(2)
+            GPIO.output(BUZZER_PIN, GPIO.LOW)
+
+        # -------------------
+        # Drowsiness Detection
+        # -------------------
+        ret, frame = cap.read()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = detector(gray)
+        for face in faces:
+            shape = predictor(gray, face)
+            leftEye = [(shape.part(i).x, shape.part(i).y) for i in range(36, 42)]
+            rightEye = [(shape.part(i).x, shape.part(i).y) for i in range(42, 48)]
+            leftEAR = eye_aspect_ratio(leftEye)
+            rightEAR = eye_aspect_ratio(rightEye)
+            ear = (leftEAR + rightEAR) / 2.0
+
+            if ear < EYE_AR_THRESH:
+                COUNTER += 1
+                if COUNTER >= EYE_AR_CONSEC_FRAMES:
+                    lcd.clear()
+                    lcd.write_string("Driver Drowsy!")
+                    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+            else:
+                COUNTER = 0
+                GPIO.output(BUZZER_PIN, GPIO.LOW)
+
+        # -------------------
+        # LCD Status Update
+        # -------------------
+        lcd.clear()
+        lcd.write_string(f"Alcohol:{alcohol_value} ")
+        lcd.cursor_pos = (1,0)
+        lcd.write_string(f"Accel:{ax:.2f},{ay:.2f}")
+
+        time.sleep(0.5)
+
+except KeyboardInterrupt:
+    cap.release()
+    GPIO.cleanup()
+    lcd.clear()
+    print("Program Stopped")

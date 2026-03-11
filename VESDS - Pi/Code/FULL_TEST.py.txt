@@ -1,0 +1,145 @@
+import cv2
+import smbus
+import time
+import math
+import RPi.GPIO as GPIO
+from scipy.spatial import distance
+from RPLCD.i2c import CharLCD
+
+# ===============================
+# GPIO and I2C Setup
+# ===============================
+GPIO.setmode(GPIO.BCM)
+RELAY_PIN = 17
+MQ3_PIN = 27
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.setup(MQ3_PIN, GPIO.IN)
+
+# LCD setup (check your address with: sudo i2cdetect -y 1)
+lcd = CharLCD('PCF8574', 0x27)
+lcd.clear()
+lcd.write_string("Initializing...")
+
+# MPU6050 setup
+MPU6050_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+ACCEL_YOUT_H = 0x3D
+ACCEL_ZOUT_H = 0x3F
+bus = smbus.SMBus(1)
+bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)
+
+def read_raw_data(addr):
+    high = bus.read_byte_data(MPU6050_ADDR, addr)
+    low = bus.read_byte_data(MPU6050_ADDR, addr + 1)
+    value = ((high << 8) | low)
+    if value > 32768:
+        value -= 65536
+    return value
+
+# ===============================
+# Camera Setup for Drowsiness Detection
+# ===============================
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Cannot open camera. Please check your webcam.")
+    exit()
+
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+
+def Detect_Eye(eye):
+    (ex, ey, ew, eh) = eye
+    top = (ex + ew // 2, ey)
+    bottom = (ex + ew // 2, ey + eh)
+    left = (ex, ey + eh // 2)
+    right = (ex + ew, ey + eh // 2)
+    poi_A = distance.euclidean(top, bottom)
+    poi_C = distance.euclidean(left, right)
+    if poi_C == 0:
+        return 1.0
+    return poi_A / poi_C
+
+# ===============================
+# Main Loop
+# ===============================
+print("System Running...")
+lcd.clear()
+lcd.write_string("System Active...")
+
+try:
+    while True:
+        # --- Alcohol Detection ---
+        alcohol_detected = GPIO.input(MQ3_PIN) == GPIO.LOW
+
+        # --- Accident Detection ---
+        acc_x = read_raw_data(ACCEL_XOUT_H) / 16384.0
+        acc_y = read_raw_data(ACCEL_YOUT_H) / 16384.0
+        acc_z = read_raw_data(ACCEL_ZOUT_H) / 16384.0
+        total_acc = math.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+        accident = total_acc > 2.0
+
+        # --- Drowsiness Detection ---
+        ret, frame = cap.read()
+        if not ret:
+            print("Camera error.")
+            break
+
+        frame = cv2.resize(frame, (640, 480))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
+
+        status = "Normal"
+        for (x, y, w, h) in faces:
+            roi_gray = gray[y:y+h, x:x+w]
+            eyes = eye_cascade.detectMultiScale(roi_gray, 1.1, 5, minSize=(20, 20))
+            ear_list = []
+            for (ex, ey, ew, eh) in eyes:
+                ear_list.append(Detect_Eye((ex, ey, ew, eh)))
+            if len(ear_list) >= 2:
+                Eye_Rat = sum(ear_list) / len(ear_list)
+                if Eye_Rat < 0.25:
+                    status = "Drowsy"
+            else:
+                status = "Drowsy"
+
+        # --- Display and Control ---
+        lcd.clear()
+        if alcohol_detected:
+            lcd.write_string("Alcohol Detected!")
+            GPIO.output(RELAY_PIN, GPIO.LOW)
+            print("ALCOHOL ALERT")
+        elif accident:
+            lcd.write_string("Accident Detected!")
+            GPIO.output(RELAY_PIN, GPIO.LOW)
+            print("ACCIDENT ALERT | Accel: {:.2f}g".format(total_acc))
+        elif status == "Drowsy":
+            lcd.write_string("Driver Drowsy!")
+            GPIO.output(RELAY_PIN, GPIO.LOW)
+            print("DROWSINESS ALERT")
+        else:
+            lcd.write_string("Driver Normal")
+            GPIO.output(RELAY_PIN, GPIO.HIGH)
+            print("SAFE | Accel: {:.2f}g".format(total_acc))
+
+        # Show camera output with status
+        cv2.putText(frame, status, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (0, 0, 255) if status != "Normal" else (0, 255, 0), 2)
+        cv2.imshow("Driver Monitor", frame)
+
+        if cv2.waitKey(10) & 0xFF == 27:
+            break
+
+        time.sleep(0.5)
+
+except KeyboardInterrupt:
+    print("Program stopped by user.")
+
+finally:
+    GPIO.output(RELAY_PIN, GPIO.HIGH)
+    GPIO.cleanup()
+    cap.release()
+    cv2.destroyAllWindows()
+    lcd.clear()
+    lcd.write_string("System Stopped.")
+    print("GPIO cleaned up and system stopped.")

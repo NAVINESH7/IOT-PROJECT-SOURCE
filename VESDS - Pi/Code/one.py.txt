@@ -1,0 +1,167 @@
+
+import serial
+import time
+import RPi.GPIO as GPIO
+
+# =========================
+# Configuration
+# =========================
+UART_PORT = '/dev/serial0'
+BAUD_RATE = 115200
+PWRKEY_PIN = 18
+PHONE_NUMBER = '1234567890'  # Replace with target phone number
+SMS_MESSAGE_PREFIX = 'Current Location: '
+
+# =========================
+# GPIO Setup
+# =========================
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(PWRKEY_PIN, GPIO.OUT)
+GPIO.output(PWRKEY_PIN, GPIO.HIGH)
+
+# =========================
+# Helper Functions
+# =========================
+def send_at_command(ser, command, wait_time=1, expected='OK'):
+    """Send AT command and check response."""
+    ser.write((command + '\r\n').encode())
+    time.sleep(wait_time)
+    response = ser.read_all().decode('utf-8', errors='ignore')
+    print(f"Command: {command} | Response: {response.strip()}")
+    return response, expected in response
+
+def power_on_module():
+    """Power on A9G."""
+    print("Powering on A9G...")
+    GPIO.output(PWRKEY_PIN, GPIO.LOW)
+    time.sleep(2)
+    GPIO.output(PWRKEY_PIN, GPIO.HIGH)
+    time.sleep(5)
+
+def init_gsm(ser):
+    """Initialize GSM network."""
+    print("Initializing GSM...")
+    # Check module response
+    _, success = send_at_command(ser, 'AT')
+    if not success:
+        raise Exception("Module not responding")
+
+    send_at_command(ser, 'ATE0')
+    send_at_command(ser, 'AT+CMGF=1')
+    send_at_command(ser, 'AT+CREG=1')
+    time.sleep(2)
+    response, _ = send_at_command(ser, 'AT+CREG?', 1)
+    if '+CREG: 1,1' not in response and '+CREG: 0,5' not in response:
+        raise Exception("Network registration failed")
+
+    send_at_command(ser, 'AT+CSQ')  # Check signal strength
+
+def init_gps(ser):
+    """Initialize GPS with retries and GPSRDY check."""
+    print("Initializing GPS...")
+    for attempt in range(3):
+        send_at_command(ser, 'AT+GPS=0')
+        time.sleep(1)
+        _, gps_on = send_at_command(ser, 'AT+GPS=1', 2)
+        if not gps_on:
+            print("Failed to power on GPS, retrying...")
+            time.sleep(3)
+            continue
+
+        # ✅ Wait for GPS ready
+        for i in range(10):  # Up to ~10 seconds
+            response, _ = send_at_command(ser, 'AT+GPSRDY?', 1)
+            if '+GPSRDY: 1' in response:
+                print("GPS is ready")
+                break
+            print(f"Waiting for GPS ready... ({i+1}/10)")
+            time.sleep(1)
+        else:
+            print("GPS not ready, retrying...")
+            continue
+
+        # ✅ Try setting GPS mode
+        response, mode_ok = send_at_command(ser, 'AT+GPSMODE=1', 2)
+        if not mode_ok and '+CME ERROR: 58' in response:
+            print("GPSMODE not supported — skipping this step")
+
+        # ✅ Start GPS
+        _, start_ok = send_at_command(ser, 'AT+GPSSTART', 2)
+        if start_ok:
+            print("GPS initialized successfully!")
+            return True
+
+        print(f"GPS init attempt {attempt + 1} failed, retrying...")
+        time.sleep(5)
+
+    raise Exception("GPS initialization failed after multiple attempts")
+
+def get_gps_location(ser):
+    """Get GPS coordinates with timeout."""
+    print("Waiting for GPS fix...")
+    timeout = 120
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        # Check GPS fix
+        response, _ = send_at_command(ser, 'AT+GPSRDY?', 1)
+        if '+GPSRDY: 1' in response:
+            # Try AT+LOCATION? first
+            response, _ = send_at_command(ser, 'AT+LOCATION?', 2)
+            if '+LOCATION:' in response:
+                parts = response.split('+LOCATION:')[1].strip().split(',')
+                if len(parts) >= 2:
+                    lat, lon = parts[0], parts[1]
+                    print(f"GPS fix acquired: {lat}, {lon}")
+                    return lat, lon
+
+            # Fallback to GNSSTF
+            response, _ = send_at_command(ser, 'AT+GNSSTF', 2)
+            if '+GNSSTF:' in response:
+                parts = response.split('+GNSSTF:')[1].strip().split(',')
+                if len(parts) >= 4:
+                    lat, lon = parts[0], parts[2]
+                    print(f"GPS fix acquired: {lat}, {lon}")
+                    return lat, lon
+        time.sleep(5)
+
+    raise Exception("No GPS fix within timeout")
+
+def send_sms(ser, phone, message):
+    """Send SMS message."""
+    print(f"Sending SMS to {phone}: {message}")
+    send_at_command(ser, f'AT+CMGS="{phone}"', 1)
+    time.sleep(1)
+    ser.write((message + chr(26)).encode())  # CTRL+Z to send
+    time.sleep(5)
+    response = ser.read_all().decode('utf-8', errors='ignore')
+    if 'OK' in response:
+        print("✅ SMS sent successfully!")
+    else:
+        print("❌ SMS send failed")
+
+# =========================
+# Main Program
+# =========================
+try:
+    power_on_module()
+    ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+
+    init_gsm(ser)
+    init_gps(ser)
+
+    lat, lon = get_gps_location(ser)
+    location_msg = f"{SMS_MESSAGE_PREFIX} Lat: {lat}, Lon: {lon}"
+    send_sms(ser, PHONE_NUMBER, location_msg)
+
+except Exception as e:
+    print(f"Error: {e}")
+
+finally:
+    if 'ser' in locals():
+        send_at_command(ser, 'AT+GPSSTOP')
+        send_at_command(ser, 'AT+GPS=0')
+        ser.close()
+    GPIO.cleanup()
+    print("Cleaned up GPIO and closed serial.")

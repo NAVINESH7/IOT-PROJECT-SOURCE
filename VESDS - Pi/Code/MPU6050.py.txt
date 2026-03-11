@@ -1,0 +1,41 @@
+import smbus
+import time
+import math
+
+# MPU6050 Registers
+MPU6050_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+ACCEL_YOUT_H = 0x3D
+ACCEL_ZOUT_H = 0x3F
+
+# Initialize I2C
+bus = smbus.SMBus(1)
+bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)
+
+def read_raw_data(addr):
+    high = bus.read_byte_data(MPU6050_ADDR, addr)
+    low = bus.read_byte_data(MPU6050_ADDR, addr+1)
+    value = ((high << 8) | low)
+    if value > 32768:
+        value -= 65536
+    return value
+
+print("🚀 Accident Detection Test Running...\n")
+
+while True:
+    # Read accelerometer values
+    acc_x = read_raw_data(ACCEL_XOUT_H) / 16384.0
+    acc_y = read_raw_data(ACCEL_YOUT_H) / 16384.0
+    acc_z = read_raw_data(ACCEL_ZOUT_H) / 16384.0
+
+    # Calculate total acceleration magnitude
+    total_acc = math.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+
+    # Accident detection threshold (example: > 2g impact)
+    if total_acc > 2.0:
+        print("⚠️ Accident Detected! | Acceleration: {:.2f}g".format(total_acc))
+    else:
+        print("✅ Safe | Acceleration: {:.2f}g".format(total_acc))
+
+    time.sleep(1)

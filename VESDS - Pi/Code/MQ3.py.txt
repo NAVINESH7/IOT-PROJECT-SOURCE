@@ -1,0 +1,20 @@
+import RPi.GPIO as GPIO
+import time
+
+SENSOR_PIN = 22
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SENSOR_PIN, GPIO.IN)
+
+print("MQ-3 Test Started")
+
+try:
+    while True:
+        if GPIO.input(SENSOR_PIN) == GPIO.LOW:
+            print("🍷 Alcohol detected!")
+        else:
+            print("No alcohol")
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    GPIO.cleanup()

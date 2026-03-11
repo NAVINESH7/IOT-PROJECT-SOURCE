@@ -1,0 +1,55 @@
+import smbus
+import time
+from RPLCD.i2c import CharLCD
+
+# ---------------------------
+# LCD Setup (I2C)
+# ---------------------------
+lcd = CharLCD('PCF8574', 0x27)  # Change address if needed
+
+# ---------------------------
+# MPU6050 Setup
+# ---------------------------
+bus = smbus.SMBus(1)
+MPU6050_ADDR = 0x68
+
+# Registers
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+
+# Wake up MPU6050
+bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)
+
+# Function to read raw data
+def read_raw_data(addr):
+    high = bus.read_byte_data(MPU6050_ADDR, addr)
+    low = bus.read_byte_data(MPU6050_ADDR, addr + 1)
+    value = ((high << 8) | low)
+    if value > 32768:
+        value = value - 65536
+    return value
+
+# ---------------------------
+# Main Loop
+# ---------------------------
+ACCIDENT_THRESHOLD = 1.5  # g-force threshold (adjust as needed)
+
+while True:
+    # Read accelerometer values
+    acc_x = read_raw_data(ACCEL_XOUT_H) / 16384.0
+    acc_y = read_raw_data(ACCEL_XOUT_H + 2) / 16384.0
+    acc_z = read_raw_data(ACCEL_XOUT_H + 4) / 16384.0
+
+    # Calculate total acceleration magnitude
+    total_acc = (acc_x**2 + acc_y**2 + acc_z**2) ** 0.5
+
+    # Decide safe or accident
+    lcd.clear()
+    if abs(total_acc - 1.0) > ACCIDENT_THRESHOLD:
+        print("ACCIDENT DETECTED 🚨")
+        lcd.write_string("ACCIDENT DETECTED")
+    else:
+        print("SAFE ✅")
+        lcd.write_string("SAFE")
+
+    time.sleep(1)

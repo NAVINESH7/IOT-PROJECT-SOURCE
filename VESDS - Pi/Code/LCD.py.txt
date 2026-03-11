@@ -1,0 +1,9 @@
+from RPLCD.i2c import CharLCD
+import time
+
+# Substitute 0x27 with your I2C address if different
+lcd = CharLCD('PCF8574', 0x27)
+
+lcd.write_string('Hello World!')
+time.sleep(5)
+lcd.clear()
