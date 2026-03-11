@@ -1,0 +1,104 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ================= WIFI =================
+const char* ssid = "Navi";
+const char* password = "12121212";
+
+WebServer server(80);
+
+// ================= MAIN MOTOR RELAY =================
+#define WELL_MOTOR_RELAY 26   // Change if needed
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(WELL_MOTOR_RELAY, OUTPUT);
+  digitalWrite(WELL_MOTOR_RELAY, LOW);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConnected to WiFi");
+  Serial.println(WiFi.localIP());
+
+  server.on("/update", handleUpdate);
+  server.begin();
+}
+
+// ================= HANDLE DATA =================
+void handleUpdate() {
+
+  if (!server.hasArg("data")) {
+    server.send(200, "text/plain", "No Data");
+    return;
+  }
+
+  String payload = server.arg("data");
+
+  Serial.println("Received Data:");
+  Serial.println(payload);
+
+  bool motorRequired = false;
+
+  int start = 0;
+
+  while (true) {
+
+    int endLine = payload.indexOf('\n', start);
+    if (endLine == -1) break;
+
+    String line = payload.substring(start, endLine);
+    start = endLine + 1;
+
+    line.trim();
+
+    int dashIndex = line.indexOf("-");
+    int pipeIndex = line.indexOf("|");
+
+    if (dashIndex == -1 || pipeIndex == -1)
+      continue;
+
+    String condition = line.substring(dashIndex + 2, pipeIndex - 1);
+    String disease = line.substring(pipeIndex + 2);
+
+    condition.trim();
+    disease.trim();
+
+    Serial.println("Condition: " + condition);
+    Serial.println("Disease: " + disease);
+
+    if (condition == "DRY" ||
+        condition == "VERYDRY" ||
+        disease == "DISEASE") {
+
+      motorRequired = true;
+      break;
+    }
+  }
+
+  // ================= MOTOR CONTROL =================
+  if (motorRequired) {
+
+    Serial.println("Well Motor ON for 6 seconds");
+
+    digitalWrite(WELL_MOTOR_RELAY, HIGH);
+    delay(6000);
+    digitalWrite(WELL_MOTOR_RELAY, LOW);
+
+    Serial.println("Well Motor OFF");
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+}
