@@ -1,0 +1,224 @@
+# -*- coding: utf-8 -*-
+
+import os
+import cv2
+import numpy as np
+import re
+import requests
+import base64
+from datetime import datetime
+from flask import Flask, render_template_string
+
+FIELD_AREA_HA = 0.24
+FIELD_AREA_ACRE = FIELD_AREA_HA * 2.47105
+
+ROWS = 2
+COLS = 3
+ZONE_AREA_ACRE = FIELD_AREA_ACRE / (ROWS * COLS)
+
+ESP32_IPS = [
+    "10.89.218.116",
+    "10.89.218.239"
+]
+
+IMAGE_DIR = "images"
+
+app = Flask(__name__)
+analysis_result = None
+
+
+def send_to_esp32_combined(message):
+    for ip in ESP32_IPS:
+        try:
+            url = f"http://{ip}/update"
+            requests.get(url, params={"data": message}, timeout=2)
+        except:
+            print(f"ESP32 {ip} not reachable")
+
+
+def extract_date(filename):
+    match = re.search(r'\d{4}-\d{2}-\d{2}', filename)
+    if match:
+        return datetime.strptime(match.group(), "%Y-%m-%d")
+    return datetime.min
+
+
+def get_latest_image():
+    files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(".tiff")]
+    if not files:
+        return None
+    latest = max(files, key=extract_date)
+    return os.path.join(IMAGE_DIR, latest)
+
+
+def process_field():
+    global analysis_result
+
+    IMAGE_PATH = get_latest_image()
+    if IMAGE_PATH is None:
+        return
+
+    print("\nProcessing:", IMAGE_PATH)
+
+    color_img = cv2.imread(IMAGE_PATH)
+    hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+
+    # Detect white polygon border
+    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    field_contour = max(contours, key=cv2.contourArea)
+
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.drawContours(mask, [field_contour], -1, 255, -1)
+
+    x, y, w_box, h_box = cv2.boundingRect(field_contour)
+
+    zone_h = h_box // ROWS
+    zone_w = w_box // COLS
+
+    zone_messages = []
+    affected_images = []
+    total_affected_area = 0
+    zone_number = 1
+
+    print("\nCOLOR BASED ZONE ANALYSIS\n")
+
+    for r in range(ROWS):
+        for c in range(COLS):
+
+            y1 = y + r * zone_h
+            y2 = y + (r + 1) * zone_h
+            x1 = x + c * zone_w
+            x2 = x + (c + 1) * zone_w
+
+            zone = hsv[y1:y2, x1:x2]
+            zone_mask = mask[y1:y2, x1:x2]
+            zone = zone[zone_mask == 255]
+
+            if zone.size == 0:
+                zone_number += 1
+                continue
+
+            total_pixels = len(zone)
+
+            hue = zone[:, 0]
+
+            dark_green = np.sum((hue >= 50) & (hue <= 75))
+            light_green = np.sum((hue >= 35) & (hue < 50))
+            yellow = np.sum((hue >= 25) & (hue < 35))
+            orange = np.sum((hue >= 10) & (hue < 25))
+            red = np.sum((hue < 10) | (hue > 170))
+
+            dg_p = dark_green / total_pixels * 100
+            lg_p = light_green / total_pixels * 100
+            y_p = yellow / total_pixels * 100
+            o_p = orange / total_pixels * 100
+            r_p = red / total_pixels * 100
+
+            if dg_p > 60:
+                condition = "VERY WET"
+                short = "WET"
+
+            elif (dg_p + lg_p) > 50:
+                condition = "WET"
+                short = "WET"
+
+            elif r_p > 30:
+                condition = "VERY DRY"
+                short = "VERYDRY"
+
+            elif o_p > 40:
+                condition = "DRY STRESS"
+                short = "DRY"
+
+            elif y_p > 40:
+                condition = "STRESSED"
+                short = "STRESS"
+
+            else:
+                condition = "MODERATE"
+                short = "MODERATE"
+
+            zone_messages.append(f"ZONE{zone_number}:{short}")
+
+            print(f"ZONE {zone_number}")
+            print(f"DarkGreen%: {dg_p:.1f}")
+            print(f"LightGreen%: {lg_p:.1f}")
+            print(f"Yellow%: {y_p:.1f}")
+            print(f"Orange%: {o_p:.1f}")
+            print(f"Red%: {r_p:.1f}")
+            print("Condition:", condition, "\n")
+
+            if short not in ["WET", "MODERATE"]:
+                total_affected_area += ZONE_AREA_ACRE
+
+                zone_img = color_img[y1:y2, x1:x2].copy()
+                zone_img[zone_mask == 0] = 0
+
+                _, buffer = cv2.imencode('.png', zone_img)
+                zone_base64 = base64.b64encode(buffer).decode('utf-8')
+
+                affected_images.append({
+                    "zone": zone_number,
+                    "condition": condition,
+                    "image": zone_base64
+                })
+
+            zone_number += 1
+
+    # Draw grid
+    grid_image = color_img.copy()
+    for r in range(ROWS):
+        for c in range(COLS):
+            y_line = y + r * zone_h
+            x_line = x + c * zone_w
+            cv2.rectangle(grid_image,
+                          (x_line, y_line),
+                          (x_line + zone_w, y_line + zone_h),
+                          (0, 255, 0), 2)
+
+    _, buffer = cv2.imencode('.png', grid_image)
+    grid_base64 = base64.b64encode(buffer).decode('utf-8')
+
+    final_packet = "NDVI_REPORT\n" + "\n".join(zone_messages)
+    send_to_esp32_combined(final_packet)
+
+    percent_affected = (total_affected_area / FIELD_AREA_ACRE) * 100
+
+    analysis_result = {
+        "grid_image": grid_base64,
+        "affected": affected_images,
+        "percent": round(percent_affected, 2)
+    }
+
+
+@app.route('/')
+def dashboard():
+    html = """
+    <h1>Color Based Field Monitoring</h1>
+
+    <h3>Percent Affected: {{result.percent}} %</h3>
+    <hr>
+
+    <h2>Full Field Grid</h2>
+    <img src="data:image/png;base64,{{result.grid_image}}" width="650">
+    <hr>
+
+    <h2>Affected Zones</h2>
+
+    {% if result.affected|length == 0 %}
+        <h3 style="color:green;">FIELD HEALTHY / WET</h3>
+    {% else %}
+        {% for zone in result.affected %}
+            <h3>Zone {{zone.zone}} - {{zone.condition}}</h3>
+            <img src="data:image/png;base64,{{zone.image}}" width="400"><br><br>
+        {% endfor %}
+    {% endif %}
+    """
+    return render_template_string(html, result=analysis_result)
+
+
+if __name__ == '__main__':
+    process_field()
+    app.run(host='0.0.0.0', port=5000)

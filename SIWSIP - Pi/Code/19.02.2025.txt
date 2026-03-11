@@ -1,0 +1,250 @@
+# -*- coding: utf-8 -*-
+
+import os
+import cv2
+import numpy as np
+import re
+import requests
+import base64
+from datetime import datetime
+from flask import Flask, render_template_string
+
+FIELD_AREA_HA = 13.9
+FIELD_AREA_ACRE = FIELD_AREA_HA * 2.47105
+
+TOTAL_ZONES = 69
+ROWS = 8
+COLS = 9
+
+REMOVE_ZONES = {1, 2, 3, 9, 10, 11, 19, 52, 54, 61, 62, 63, 69}
+
+# BOTH ESP32 IPs
+ESP32_IPS = [
+    "10.89.218.54",
+    "10.89.218.239"
+]
+
+IMAGE_DIR = "images"
+
+app = Flask(__name__)
+analysis_result = None
+
+
+# ================= ESP32 =================
+
+def send_to_esp32_combined(message):
+    for ip in ESP32_IPS:
+        try:
+            url = f"http://{ip}/update"
+            requests.get(url, params={"data": message}, timeout=3)
+        except:
+            print(f"ESP32 {ip} not reachable")
+
+
+# ================= IMAGE =================
+
+def extract_date(filename):
+    match = re.search(r'\d{4}-\d{2}-\d{2}', filename)
+    if match:
+        return datetime.strptime(match.group(), "%Y-%m-%d")
+    return datetime.min
+
+
+def get_latest_image():
+    files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(".tiff")]
+    if not files:
+        return None
+    latest = max(files, key=extract_date)
+    return os.path.join(IMAGE_DIR, latest)
+
+
+# ================= MAIN =================
+
+def process_field():
+    global analysis_result
+
+    IMAGE_PATH = get_latest_image()
+    if IMAGE_PATH is None:
+        print("No image found")
+        return
+
+    print("\nProcessing:", IMAGE_PATH)
+
+    color_img = cv2.imread(IMAGE_PATH)
+    hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+
+    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    field_contour = max(contours, key=cv2.contourArea)
+
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.drawContours(mask, [field_contour], -1, 255, -1)
+
+    x, y, w_box, h_box = cv2.boundingRect(field_contour)
+
+    zone_h = h_box // ROWS
+    zone_w = w_box // COLS
+
+    original_index = 1
+    new_zone_number = 1
+
+    zone_messages = []
+    affected_zones = []
+
+    print("\nZONE ANALYSIS\n")
+
+    for r in range(ROWS):
+        for c in range(COLS):
+
+            if original_index > TOTAL_ZONES:
+                break
+
+            if original_index in REMOVE_ZONES:
+                original_index += 1
+                continue
+
+            y1 = y + r * zone_h
+            y2 = y + (r + 1) * zone_h
+            x1 = x + c * zone_w
+            x2 = x + (c + 1) * zone_w
+
+            zone_mask = mask[y1:y2, x1:x2]
+            zone = hsv[y1:y2, x1:x2]
+            zone_pixels = zone[zone_mask == 255]
+
+            if zone_pixels.size == 0:
+                original_index += 1
+                continue
+
+            hue = zone_pixels[:, 0]
+            total_pixels = len(zone_pixels)
+
+            dark_green = np.sum((hue >= 50) & (hue <= 75))
+            yellow = np.sum((hue >= 25) & (hue < 35))
+            red = np.sum((hue < 10) | (hue > 170))
+
+            dg_p = dark_green / total_pixels * 100
+            y_p = yellow / total_pixels * 100
+            r_p = red / total_pixels * 100
+
+            # CONDITION
+            if dg_p > 60:
+                condition = "WET"
+            elif r_p > 30:
+                condition = "VERYDRY"
+            elif y_p > 40:
+                condition = "STRESS"
+            else:
+                condition = "MODERATE"
+
+            # DISEASE
+            if y_p > 40:
+                disease = "MODERATE DISEASE"
+            elif y_p > 20:
+                disease = "EARLY DISEASE"
+            else:
+                disease = "NO DISEASE"
+
+            print(f"ZONE {new_zone_number} → {condition} | {disease}")
+
+            zone_messages.append(
+                f"ZONE {new_zone_number} → {condition} | {disease}"
+            )
+
+            # SAVE ALL AFFECTED ZONES (not only disease)
+            if condition != "MODERATE" or disease != "NO DISEASE":
+
+                zone_img = color_img[y1:y2, x1:x2].copy()
+                zone_img[zone_mask == 0] = 0
+
+                _, buffer = cv2.imencode('.png', zone_img)
+                zone_base64 = base64.b64encode(buffer).decode('utf-8')
+
+                affected_zones.append({
+                    "zone": new_zone_number,
+                    "condition": condition,
+                    "disease": disease,
+                    "image": zone_base64
+                })
+
+            new_zone_number += 1
+            original_index += 1
+
+    # ================= DRAW GRID =================
+
+    grid_image = color_img.copy()
+    original_index = 1
+    draw_number = 1
+
+    for r in range(ROWS):
+        for c in range(COLS):
+
+            if original_index > TOTAL_ZONES:
+                break
+
+            if original_index in REMOVE_ZONES:
+                original_index += 1
+                continue
+
+            y1 = y + r * zone_h
+            y2 = y + (r + 1) * zone_h
+            x1 = x + c * zone_w
+            x2 = x + (c + 1) * zone_w
+
+            cv2.rectangle(grid_image, (x1, y1), (x2, y2), (0,255,0), 1)
+            cv2.putText(grid_image, str(draw_number),
+                        (x1+5, y1+20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255,0,0), 1)
+
+            draw_number += 1
+            original_index += 1
+
+    cv2.drawContours(grid_image, [field_contour], -1, (0,255,0), 2)
+
+    _, buffer = cv2.imencode('.png', grid_image)
+    grid_base64 = base64.b64encode(buffer).decode('utf-8')
+
+    # Send to ESP32
+    final_packet = ""
+    for msg in zone_messages:
+        final_packet += msg + "\n"
+
+    send_to_esp32_combined(final_packet)
+
+    analysis_result = {
+        "grid_image": grid_base64,
+        "affected": affected_zones
+    }
+
+
+@app.route('/')
+def dashboard():
+    html = """
+    <h1>Field Monitoring</h1>
+
+    <h2>Clean Grid View</h2>
+    <img src="data:image/png;base64,{{result.grid_image}}" width="700">
+    <hr>
+
+    <h2>Affected Zones</h2>
+
+    {% if result.affected|length == 0 %}
+        <h3 style="color:green;">NO AFFECTED ZONES</h3>
+    {% else %}
+        {% for zone in result.affected %}
+            <h3 style="color:red;">
+            Zone {{zone.zone}} - {{zone.condition}} | {{zone.disease}}
+            </h3>
+            <img src="data:image/png;base64,{{zone.image}}" width="400"><br><br>
+        {% endfor %}
+    {% endif %}
+    """
+    return render_template_string(html, result=analysis_result)
+
+
+if __name__ == '__main__':
+    process_field()
+    app.run(host='0.0.0.0', port=5000)

@@ -1,0 +1,246 @@
+# -*- coding: utf-8 -*-
+
+import os
+import cv2
+import numpy as np
+import re
+import requests
+import base64
+from datetime import datetime
+from flask import Flask, render_template_string
+
+# ================= FIELD CONFIG =================
+
+ROWS = 2
+COLS = 3
+TOTAL_ZONES = ROWS * COLS
+
+IMAGE_DIR = "images"
+
+# ================= ESP32 IP LIST =================
+
+ESP32_IPS = [
+    "10.89.218.90",
+    "10.89.218.80",
+    "10.89.218.191",
+    "10.89.218.145",
+    "10.89.218.201",   # <-- replace with valid IP
+    "10.89.218.167",   # <-- replace with valid IP
+    "10.89.218.185"    # <-- replace with valid IP
+]
+
+app = Flask(__name__)
+analysis_result = None
+
+
+# ================= SEND DATA =================
+
+def send_to_all_esps(message):
+    for ip in ESP32_IPS:
+        try:
+            url = f"http://{ip}/update"
+            requests.get(url, params={"data": message}, timeout=3)
+            print(f"Sent to {ip}")
+        except:
+            print(f"ESP {ip} not reachable")
+
+
+# ================= IMAGE HELPERS =================
+
+def extract_date(filename):
+    match = re.search(r'\d{4}-\d{2}-\d{2}', filename)
+    if match:
+        return datetime.strptime(match.group(), "%Y-%m-%d")
+    return datetime.min
+
+
+def get_latest_image():
+    files = [f for f in os.listdir(IMAGE_DIR)
+             if f.lower().endswith(".tiff")]
+    if not files:
+        return None
+    latest = max(files, key=extract_date)
+    return os.path.join(IMAGE_DIR, latest)
+
+
+# ================= MAIN ANALYSIS =================
+
+def process_field():
+    global analysis_result
+
+    path = get_latest_image()
+    if path is None:
+        print("No image found")
+        return
+
+    print("Processing:", path)
+
+    img = cv2.imread(path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(
+        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        print("No field detected")
+        return
+
+    field_contour = max(contours, key=cv2.contourArea)
+
+    rect = cv2.minAreaRect(field_contour)
+    box = cv2.boxPoints(rect)
+    box = box.astype(int)
+
+    width = int(rect[1][0])
+    height = int(rect[1][1])
+
+    if width < height:
+        width, height = height, width
+
+    src_pts = box.astype("float32")
+    dst_pts = np.array([
+        [0, 0],
+        [width - 1, 0],
+        [width - 1, height - 1],
+        [0, height - 1]
+    ], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    Minv = cv2.getPerspectiveTransform(dst_pts, src_pts)
+
+    warped = cv2.warpPerspective(img, M, (width, height))
+
+    zone_w = width // COLS
+    zone_h = height // ROWS
+
+    zone_messages = []
+    affected_zones = []
+
+    for r in range(ROWS):
+        for c in range(COLS):
+
+            x1 = c * zone_w
+            x2 = (c + 1) * zone_w
+            y1 = r * zone_h
+            y2 = (r + 1) * zone_h
+
+            zone = warped[y1:y2, x1:x2]
+            pixels = zone.reshape(-1, 3)
+
+            if len(pixels) == 0:
+                continue
+
+            b = pixels[:, 0].astype(float)
+            g = pixels[:, 1].astype(float)
+            rch = pixels[:, 2].astype(float)
+
+            green_strength = g - rch
+            red_strength = rch - g
+
+            total = len(green_strength)
+
+            verywet = np.sum(green_strength > 60)
+            wet = np.sum((green_strength > 30) & (green_strength <= 60))
+            good = np.sum((green_strength > 10) & (green_strength <= 30))
+            dry = np.sum((red_strength > 20) & (red_strength <= 60))
+            verydry = np.sum(red_strength > 60)
+
+            if verywet / total > 0.4:
+                condition = "VERYWET"
+            elif wet / total > 0.4:
+                condition = "WET"
+            elif good / total > 0.4:
+                condition = "GOOD"
+            elif verydry / total > 0.3:
+                condition = "VERYDRY"
+            elif dry / total > 0.2:
+                condition = "DRY"
+            else:
+                condition = "GOOD"
+
+            hsv_zone = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV)
+            hue = hsv_zone[:, :, 0].flatten()
+            yellow_pixels = np.sum((hue >= 20) & (hue <= 35))
+
+            if yellow_pixels / total > 0.25:
+                disease = "DISEASE"
+            else:
+                disease = "NO DISEASE"
+
+            zone_no = r * COLS + c + 1
+
+            msg = f"ZONE {zone_no} - {condition} | {disease}"
+            zone_messages.append(msg)
+
+            if condition in ["DRY", "VERYDRY"] or disease == "DISEASE":
+                _, buf = cv2.imencode('.png', zone)
+                zone_base64 = base64.b64encode(buf).decode('utf-8')
+
+                affected_zones.append({
+                    "zone": zone_no,
+                    "condition": condition,
+                    "disease": disease,
+                    "image": zone_base64
+                })
+
+            pts = np.array([
+                [x1, y1],
+                [x2, y1],
+                [x2, y2],
+                [x1, y2]
+            ], dtype="float32")
+
+            original_pts = cv2.perspectiveTransform(
+                np.array([pts]), Minv
+            )[0].astype(int)
+
+            cv2.polylines(img, [original_pts], True, (0, 255, 0), 2)
+
+            cx = int(np.mean(original_pts[:, 0]))
+            cy = int(np.mean(original_pts[:, 1]))
+
+            cv2.putText(
+                img, str(zone_no),
+                (cx, cy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (255, 0, 0), 2
+            )
+
+    final_packet = "\n".join(zone_messages)
+    print("\nSending Data:\n", final_packet)
+
+    send_to_all_esps(final_packet)
+
+    _, buffer = cv2.imencode('.png', img)
+    grid_base64 = base64.b64encode(buffer).decode('utf-8')
+
+    analysis_result = {
+        "grid_image": grid_base64,
+        "affected": affected_zones
+    }
+
+
+# ================= DASHBOARD =================
+
+@app.route('/')
+def dashboard():
+    html = """
+    <h1>Field Monitoring</h1>
+    <img src="data:image/png;base64,{{result.grid_image}}" width="800">
+    <hr>
+    <h2>Defected Zones</h2>
+    {% for zone in result.affected %}
+        <h3 style="color:red;">
+        Zone {{zone.zone}} - {{zone.condition}} | {{zone.disease}}
+        </h3>
+        <img src="data:image/png;base64,{{zone.image}}" width="400"><hr>
+    {% endfor %}
+    """
+    return render_template_string(html, result=analysis_result)
+
+
+if __name__ == '__main__':
+    process_field()
+    app.run(host='0.0.0.0', port=5000)

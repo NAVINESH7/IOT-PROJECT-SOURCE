@@ -1,0 +1,197 @@
+# -*- coding: utf-8 -*-
+
+import os
+import cv2
+import numpy as np
+import re
+import requests
+from datetime import datetime
+
+# ============================================
+# CONFIGURATION
+# ============================================
+FIELD_AREA_HA = 0.24
+FIELD_AREA_ACRE = FIELD_AREA_HA * 2.47105
+
+ROWS = 2
+COLS = 3
+ZONE_AREA_ACRE = FIELD_AREA_ACRE / (ROWS * COLS)
+
+# Two ESP32 IP addresses
+ESP32_IPS = [
+    "10.89.218.116",   # ESP32-1
+    "10.89.218.239"    # ESP32-2
+]
+
+# ============================================
+# FUNCTION TO SEND COMBINED PACKET
+# ============================================
+def send_to_esp32_combined(message):
+    for ip in ESP32_IPS:
+        try:
+            url = f"http://{ip}/update"
+            requests.get(url, params={"data": message}, timeout=2)
+            print(f"Sent to {ip}")
+        except:
+            print(f"ESP32 {ip} not reachable")
+
+# ============================================
+# SELECT LATEST IMAGE
+# ============================================
+IMAGE_DIR = "images"
+files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(".tiff")]
+
+if len(files) == 0:
+    print("No NDVI TIFF images found.")
+    exit()
+
+def extract_date(filename):
+    match = re.search(r'\d{4}-\d{2}-\d{2}', filename)
+    if match:
+        return datetime.strptime(match.group(), "%Y-%m-%d")
+    return datetime.min
+
+latest_image = max(files, key=extract_date)
+IMAGE_PATH = os.path.join(IMAGE_DIR, latest_image)
+
+print("\nProcessing image:", latest_image)
+print("Total Field Area:", round(FIELD_AREA_ACRE, 3), "acres")
+
+# ============================================
+# LOAD NDVI IMAGE
+# ============================================
+img = cv2.imread(IMAGE_PATH, cv2.IMREAD_UNCHANGED)
+
+if img is None:
+    print("Error loading NDVI image.")
+    exit()
+
+img = img.astype(np.float32)
+
+# Handle multi-band TIFF
+if img.ndim == 3:
+    img = img[:, :, 0]
+
+# Convert 0–255 to -1 to +1
+ndvi = (img / 255.0) * 2.0 - 1.0
+
+# ============================================
+# APPLY WHITE BORDER MASK
+# ============================================
+color_img = cv2.imread(IMAGE_PATH)
+gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+
+_, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+field_contour = max(contours, key=cv2.contourArea)
+
+mask = np.zeros(gray.shape, dtype=np.uint8)
+cv2.drawContours(mask, [field_contour], -1, 255, -1)
+
+ndvi[mask == 0] = np.nan
+
+# ============================================
+# ZONE ANALYSIS
+# ============================================
+h, w = ndvi.shape
+zone_h = h // ROWS
+zone_w = w // COLS
+
+zone_number = 1
+total_affected_area = 0
+zone_messages = []
+
+print("\nAFFECTED ZONES ANALYSIS\n")
+
+for r in range(ROWS):
+    for c in range(COLS):
+
+        y1 = r * zone_h
+        y2 = (r + 1) * zone_h
+        x1 = c * zone_w
+        x2 = (c + 1) * zone_w
+
+        zone = ndvi[y1:y2, x1:x2]
+        zone = zone[~np.isnan(zone)]
+
+        if zone.size == 0:
+            zone_number += 1
+            continue
+
+        mean_ndvi = np.mean(zone)
+        std_ndvi = np.std(zone)
+
+        # =====================================
+        # CLASSIFICATION
+        # =====================================
+        if mean_ndvi < 0.20:
+            full_condition = "VERY DRY / BARE SOIL"
+            short_condition = "VERYDRY"
+
+        elif mean_ndvi < 0.30:
+            full_condition = "DRY STRESS"
+            short_condition = "DRY"
+
+        elif 0.30 <= mean_ndvi <= 0.45 and std_ndvi > 0.07:
+            full_condition = "DISEASE SUSPECTED"
+            short_condition = "DISEASE"
+
+        elif 0.30 <= mean_ndvi <= 0.45:
+            full_condition = "MODERATE STRESS"
+            short_condition = "STRESS"
+
+        elif mean_ndvi > 0.60:
+            full_condition = "WET / VERY HEALTHY"
+            short_condition = "WET"
+
+        else:
+            full_condition = "HEALTHY"
+            short_condition = "HEALTHY"
+
+        # Collect formatted zone message
+        zone_messages.append(f"ZONE{zone_number}:{short_condition}")
+
+        # Print detailed only for abnormal zones
+        if short_condition not in ["HEALTHY", "WET"]:
+            total_affected_area += ZONE_AREA_ACRE
+
+            print(f"ZONE {zone_number}")
+            print(f"Mean NDVI       : {mean_ndvi:.2f}")
+            print(f"NDVI Variation  : {std_ndvi:.2f}")
+            print(f"Condition       : {full_condition}")
+            print(f"Affected Area   : {ZONE_AREA_ACRE:.3f} acres\n")
+
+        zone_number += 1
+
+# ============================================
+# CREATE CLEAN PACKET (NO COMMAS)
+# ============================================
+final_packet = "NDVI_REPORT\n" + "\n".join(zone_messages)
+
+print("\nSending Combined Packet:\n")
+print(final_packet)
+
+send_to_esp32_combined(final_packet)
+
+# ============================================
+# FINAL SUMMARY
+# ============================================
+print("\n----------------------------------")
+
+percent_affected = (total_affected_area / FIELD_AREA_ACRE) * 100
+
+if total_affected_area == 0:
+    print("FINAL STATUS: FIELD HEALTHY")
+else:
+    print("TOTAL AFFECTED AREA :", round(total_affected_area,3), "acres")
+    print("PERCENT FIELD AFFECTED :", round(percent_affected,2), "%")
+
+    if percent_affected > 60:
+        print("FINAL STATUS: FIELD UNDER SEVERE STRESS")
+    elif percent_affected > 30:
+        print("FINAL STATUS: FIELD UNDER MODERATE STRESS")
+    else:
+        print("FINAL STATUS: FIELD UNDER MINOR STRESS")
+
+print("----------------------------------")

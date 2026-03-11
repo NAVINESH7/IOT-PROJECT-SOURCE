@@ -1,0 +1,167 @@
+# -*- coding: utf-8 -*-
+
+import os
+import cv2
+import numpy as np
+import re
+from datetime import datetime
+
+# ============================================
+# FIELD PARAMETERS
+# ============================================
+FIELD_AREA_HA = 0.24
+FIELD_AREA_ACRE = FIELD_AREA_HA * 2.47105
+
+ROWS = 2
+COLS = 3
+ZONE_AREA_ACRE = FIELD_AREA_ACRE / (ROWS * COLS)
+
+# ============================================
+# SELECT LATEST IMAGE BY DATE (YYYY-MM-DD)
+# ============================================
+IMAGE_DIR = "images"
+
+files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(".tiff")]
+
+if len(files) == 0:
+    print("No NDVI TIFF images found.")
+    exit()
+
+def extract_date(filename):
+    match = re.search(r'\d{4}-\d{2}-\d{2}', filename)
+    if match:
+        return datetime.strptime(match.group(), "%Y-%m-%d")
+    return datetime.min
+
+latest_image = max(files, key=extract_date)
+IMAGE_PATH = os.path.join(IMAGE_DIR, latest_image)
+
+print("\nProcessing image:", latest_image)
+print("Total Field Area:", round(FIELD_AREA_ACRE, 3), "acres")
+
+# ============================================
+# LOAD NDVI TIFF (MULTI-BAND SAFE)
+# ============================================
+img = cv2.imread(IMAGE_PATH, cv2.IMREAD_UNCHANGED)
+
+if img is None:
+    print("Error loading NDVI image.")
+    exit()
+
+img = img.astype(np.float32)
+
+# Fix multi-band image
+if img.ndim == 3:
+    img = img[:, :, 0]
+
+# Convert 0–255 scaled NDVI → -1 to +1
+ndvi = (img / 255.0) * 2.0 - 1.0
+
+# ============================================
+# WHITE BORDER POLYGON MASK
+# ============================================
+color_img = cv2.imread(IMAGE_PATH)
+gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+
+_, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+if len(contours) == 0:
+    print("White boundary not detected.")
+    exit()
+
+field_contour = max(contours, key=cv2.contourArea)
+
+mask = np.zeros(gray.shape, dtype=np.uint8)
+cv2.drawContours(mask, [field_contour], -1, 255, -1)
+
+ndvi[mask == 0] = np.nan
+
+# ============================================
+# ZONE ANALYSIS
+# ============================================
+h, w = ndvi.shape
+zone_h = h // ROWS
+zone_w = w // COLS
+
+zone_number = 1
+total_affected_area = 0
+
+print("\nAFFECTED ZONES ANALYSIS\n")
+
+for r in range(ROWS):
+    for c in range(COLS):
+
+        y1 = r * zone_h
+        y2 = (r + 1) * zone_h
+        x1 = c * zone_w
+        x2 = (c + 1) * zone_w
+
+        zone = ndvi[y1:y2, x1:x2]
+        zone = zone[~np.isnan(zone)]
+
+        if zone.size == 0:
+            zone_number += 1
+            continue
+
+        mean_ndvi = np.mean(zone)
+        std_ndvi = np.std(zone)
+
+        condition = None
+
+        # =====================================
+        # CLASSIFICATION RULES
+        # =====================================
+        if mean_ndvi < 0.20:
+            condition = "VERY DRY / BARE SOIL"
+
+        elif mean_ndvi < 0.30:
+            condition = "DRY STRESS"
+
+        elif 0.30 <= mean_ndvi <= 0.45 and std_ndvi > 0.07:
+            condition = "DISEASE SUSPECTED"
+
+        elif 0.30 <= mean_ndvi <= 0.45:
+            condition = "MODERATE STRESS"
+
+        elif mean_ndvi > 0.60:
+            condition = "WET / VERY HEALTHY"
+
+        else:
+            condition = "HEALTHY"
+
+        # Print only abnormal zones
+        if condition not in ["HEALTHY", "WET / VERY HEALTHY"]:
+
+            total_affected_area += ZONE_AREA_ACRE
+
+            print(f"ZONE {zone_number}")
+            print(f"Mean NDVI       : {mean_ndvi:.2f}")
+            print(f"NDVI Variation  : {std_ndvi:.2f}")
+            print(f"Condition       : {condition}")
+            print(f"Affected Area   : {ZONE_AREA_ACRE:.3f} acres\n")
+
+        zone_number += 1
+
+# ============================================
+# FINAL SUMMARY
+# ============================================
+print("----------------------------------")
+
+percent_affected = (total_affected_area / FIELD_AREA_ACRE) * 100
+
+if total_affected_area == 0:
+    print("ALL ZONES HEALTHY")
+    print("FINAL STATUS: FIELD HEALTHY")
+else:
+    print("TOTAL AFFECTED AREA :", round(total_affected_area, 3), "acres")
+    print("PERCENT FIELD AFFECTED :", round(percent_affected, 2), "%")
+
+    if percent_affected > 60:
+        print("\nFINAL STATUS: FIELD UNDER SEVERE STRESS")
+    elif percent_affected > 30:
+        print("\nFINAL STATUS: FIELD UNDER MODERATE STRESS")
+    else:
+        print("\nFINAL STATUS: FIELD UNDER MINOR STRESS")
+
+print("----------------------------------")

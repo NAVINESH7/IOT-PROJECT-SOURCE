@@ -1,0 +1,139 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ================= WIFI =================
+const char* ssid = "Navinesh";
+const char* password = "123123123";
+
+WebServer server(80);
+
+// ================= ZONE CONFIG =================
+// 🔥 CHANGE THIS FOR EACH ESP (1–6)
+#define MY_ZONE 1      
+
+#define WATER_RELAY 26      // Relay 1 (Water Valve)
+#define DISEASE_RELAY 27    // Relay 2 (Fertilizer)
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(WATER_RELAY, OUTPUT);
+  pinMode(DISEASE_RELAY, OUTPUT);
+
+  // Initial state OFF
+  digitalWrite(WATER_RELAY, LOW);
+  digitalWrite(DISEASE_RELAY, LOW);
+
+  // Connect WiFi
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConnected to WiFi");
+  Serial.println(WiFi.localIP());
+
+  server.on("/update", handleUpdate);
+  server.begin();
+}
+
+// ================= HANDLE UPDATE =================
+void handleUpdate() {
+
+  if (!server.hasArg("data")) {
+    server.send(200, "text/plain", "No Data");
+    return;
+  }
+
+  String payload = server.arg("data");
+
+  Serial.println("Received Data:");
+  Serial.println(payload);
+
+  int start = 0;
+
+  while (start < payload.length()) {
+
+    int endLine = payload.indexOf('\n', start);
+
+    // 🔥 Process last line properly
+    if (endLine == -1) {
+      endLine = payload.length();
+    }
+
+    String line = payload.substring(start, endLine);
+    start = endLine + 1;
+
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int dashIndex = line.indexOf("-");
+    int pipeIndex = line.indexOf("|");
+
+    if (dashIndex == -1 || pipeIndex == -1)
+      continue;
+
+    // ================= EXTRACT ZONE =================
+    String zonePart = line.substring(0, dashIndex);
+    zonePart.replace("ZONE", "");
+    zonePart.trim();
+
+    int zoneNumber = zonePart.toInt();
+
+    // Only process this ESP's zone
+    if (zoneNumber != MY_ZONE)
+      continue;
+
+    // ================= EXTRACT CONDITION =================
+    String condition = line.substring(dashIndex + 1, pipeIndex);
+    condition.trim();
+
+    // ================= EXTRACT DISEASE INFO =================
+    String diseaseInfo = line.substring(pipeIndex + 1);
+    diseaseInfo.trim();
+
+    // ================= SERIAL OUTPUT =================
+    Serial.println("Matched Zone: " + String(zoneNumber));
+    Serial.println("Condition: " + condition);
+    Serial.println("Disease: " + diseaseInfo);
+
+    // ================= PRIORITY 1: DISEASE =================
+    if (diseaseInfo == "DISEASE") {
+
+      Serial.println("Disease Condition Triggered");
+
+      digitalWrite(WATER_RELAY, HIGH);
+
+      // Fertilizer pulse 3 times (1 sec ON / 1 sec OFF)
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(DISEASE_RELAY, HIGH);
+        delay(1000);
+        digitalWrite(DISEASE_RELAY, LOW);
+        delay(1000);
+      }
+
+      digitalWrite(WATER_RELAY, LOW);
+    }
+
+    // ================= PRIORITY 2: DRY =================
+    else if (condition == "DRY" || condition == "VERYDRY") {
+
+      Serial.println("Dry Condition Triggered");
+
+      digitalWrite(WATER_RELAY, HIGH);
+      delay(6000);
+      digitalWrite(WATER_RELAY, LOW);
+    }
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+}
